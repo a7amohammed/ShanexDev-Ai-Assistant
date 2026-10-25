@@ -1,13 +1,13 @@
 # Shanex Dev
 # AI Assistant with Google Gemini API
 
-A clean, minimalist, lightweight AI assistant built with **Flask** and **Google Generative AI (Gemini 1.5 Flash)**. Perfect for quick deployment, embedding on platforms like **shanexdev.odoo.com**, and monetizing with ads!
+A clean, minimalist, lightweight AI assistant built with **Flask** and **Google Generative AI (Gemini)**. Perfect for quick deployment, embedding on platforms like **shanexdev.odoo.com**, and monetizing with ads!
 
 ---
 
 ## Features
 - **Lightweight UI**: Fast, clean Tailwind CSS chat interface.
-- **Google Gemini API**: Powered by `gemini-1.5-flash` for fast and intelligent responses.
+- **Google Gemini API**: Powered by `gemini` for fast and intelligent responses.
 - **Ad-Ready**: Pre-configured placeholders for banner ads/monetization.
 - **Easy Setup**: Minimal Python requirements (`Flask`, `google-generativeai`, `python-dotenv`).
 
@@ -29,7 +29,7 @@ ai-assistant/
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/YOUR_USERNAME/ai-assistant.git
+   git clone the rebo
    cd ai-assistant
    ```
 
