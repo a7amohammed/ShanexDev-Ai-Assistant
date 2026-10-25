@@ -1,4 +1,4 @@
-# shanexdev
+# Shanex Dev
 # AI Assistant with Google Gemini API
 
 A clean, minimalist, lightweight AI assistant built with **Flask** and **Google Generative AI (Gemini 1.5 Flash)**. Perfect for quick deployment, embedding on platforms like **shanexdev.odoo.com**, and monetizing with ads!
