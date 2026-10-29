@@ -1,0 +1,252 @@
+From e87376540a23967690d4a6085e0e527eb2f4cee5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 09:03:30 +0000
+Subject: [PATCH 2/2] Wake phrase is just 'wake up' (no name required)
+
+---
+ README.md            | 15 +++++++--------
+ main.py              | 38 ++++++++++++++++----------------------
+ tests/test_shanex.py | 38 +++++++++++++++++++-------------------
+ 3 files changed, 42 insertions(+), 49 deletions(-)
+
+diff --git a/README.md b/README.md
+index 7e74017..70b0873 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+ # Shanex
+ 
+-A voice-first CLI AI assistant. Say **"wake up Shanex"** and it answers **"Wake up"**.
++A voice-first CLI AI assistant. Say **"wake up"** and it answers **"Wake up"**.
+ 
+ ## Features
+ 
+@@ -21,10 +21,9 @@ A voice-first CLI AI assistant. Say **"wake up Shanex"** and it answers **"Wake
+   - `voice faster` / `voice slower` / `voice normal`
+ 
+ ### 🗣️ **Wake Phrase**
+-- Say **"wake up Shanex"** to wake the assistant from standby
++- Say **"wake up"** (no name needed) to wake the assistant from standby
+ - The spoken reply is exactly **`Wake up`** - nothing before or after it
+-- Common speech-to-text spellings of the name are accepted (for example "Shanks", "Chanex", "Shane X")
+-- The old name ("wake up Jarvis") no longer wakes the assistant
++- Only short phrases (up to 5 words) count, so "I have to wake up early tomorrow" does not trigger it
+ - Say "sleep" or "standby" to return to standby mode
+ - The microphone is muted while Shanex speaks, so it never hears itself
+ 
+@@ -88,9 +87,9 @@ python3 main.py --selftest # self-check
+ ### Interaction Flow
+ 
+ 1. **Startup**: Shanex enters standby and waits for the wake phrase
+-2. **Wake**: say "wake up Shanex" → Shanex says "Wake up"
++2. **Wake**: say "wake up" → Shanex says "Wake up"
+ 3. **Active**: Speak commands or questions
+-4. **Sleep**: say "sleep" → "Standing by, Sir. Say wake up Shanex."
++4. **Sleep**: say "sleep" → "Standing by, Sir. Say wake up."
+ 5. **Exit**: say "exit" or press Ctrl+C
+ 
+ ### Example Commands
+@@ -124,7 +123,7 @@ python3 main.py --selftest # self-check
+ main.py
+ ├── Memory            - Persistent JSON conversation history
+ ├── MoonshineSTT      - Offline streaming speech recognition
+-├── is_wake_phrase()  - Tolerant "wake up Shanex" matcher
++├── is_wake_phrase()  - "wake up" matcher
+ ├── TTS               - Edge-TTS + gTTS fallback
+ ├── ScreenControl     - pyautogui + pytesseract automation
+ ├── OllamaLLM         - Ollama client wrapper
+@@ -160,7 +159,7 @@ Edit constants at the top of `main.py`:
+ - `DEXTER_VOICE` - Any edge-tts voice
+ - `DEXTER_SPEED` / `DEXTER_PITCH` - Voice parameters
+ - `WAKE_RESPONSE` - What Shanex says on wake (keep it exactly `Wake up`)
+-- `_WAKE_NAME_VARIANTS` - Accepted spellings of the name
++- `WAKE_MAX_WORDS` - Longest utterance that can count as the wake phrase
+ 
+ ## License
+ 
+diff --git a/main.py b/main.py
+index 11123ac..610af9d 100644
+--- a/main.py
++++ b/main.py
+@@ -20,7 +20,7 @@ Features
+     - `press <key>` / `hotkey <k1> <k2>` → key input (y/N confirmation)
+     - `scroll <n>` → scroll (y/N confirmation)
+     - `speed <value>` → set voice speed
+-* Voice wake phrase: say "wake up Shanex" (STT-based, no clap detection);
++* Voice wake phrase: say "wake up" (STT-based, no clap detection);
+   Shanex answers with exactly: Wake up
+ * Voice settings: dark, measured, slightly slower
+ * Privacy: command output / OCR / errors never stored in memory
+@@ -214,33 +214,27 @@ class Memory:
+ memory = Memory(MEMORY_PATH)
+ 
+ # ----------------------------------------------------------------------
+-# Wake phrase: "wake up Shanex"  ->  spoken reply: "Wake up" (nothing else)
++# Wake phrase: "wake up"  ->  spoken reply: "Wake up" (nothing else)
+ # ----------------------------------------------------------------------
+-WAKE_PHRASE = os.getenv("WAKE_PHRASE", "wake up shanex")
++WAKE_PHRASE = "wake up"
+ # Exactly what Shanex says when the wake phrase is detected. Do not add words.
+ WAKE_RESPONSE = "Wake up"
+-_WAKE_NAME_VARIANTS = ("shanex", "shanx", "shanks", "shaneks", "shanecks", "shannex", "shanix",
+-                       "shanax", "shanek", "chanex", "channex", "shane")
++# Standby ignores long sentences, so a casual "I have to wake up early" does not trigger it.
++WAKE_MAX_WORDS = 5
+ 
+ 
+ def is_wake_phrase(text: str) -> bool:
+-    """True if `text` sounds like 'wake up Shanex'.
++    """True if `text` is the wake phrase "wake up" (no name needed).
+ 
+-    Tolerant on purpose: speech-to-text often spells the name differently
+-    ('Shanks', 'Chanex'...), so we need 'wake' + 'up' and any known variant of
+-    the name, in that order, anywhere in the sentence.
++    Accepts "wake up", "wakeup", "wake-up" and short variants such as
++    "hey wake up" - but only for short utterances (<= WAKE_MAX_WORDS words).
+     """
+     words = re.findall(r"[a-z']+", (text or "").lower())
+-    if len(words) < 2:
++    if not words or len(words) > WAKE_MAX_WORDS:
+         return False
+-    for i, w in enumerate(words):
+-        if w in ("wake", "wakeup", "wait") and i + 1 < len(words):
+-            rest = words[i + 1:]
+-            if w == "wakeup":
+-                return any(v in rest for v in _WAKE_NAME_VARIANTS)
+-            if rest[0] == "up" and any(v in rest[1:] for v in _WAKE_NAME_VARIANTS):
+-                return True
+-    return False
++    if "wakeup" in words:
++        return True
++    return any(w == "wake" and words[i + 1] == "up" for i, w in enumerate(words[:-1]))
+ 
+ # ----------------------------------------------------------------------
+ # Speech-to-Text (offline Moonshine, streaming)
+@@ -1041,7 +1035,7 @@ class JarvisController:
+     """Main controller with wake/sleep state machine."""
+ 
+     def __init__(self):
+-        # Voice mode starts in standby and waits for "wake up Shanex".
++        # Voice mode starts in standby and waits for "wake up".
+         # Text mode (no STT) is always awake.
+         self.awake = stt is None
+ 
+@@ -1062,7 +1056,7 @@ class JarvisController:
+         if self.awake:
+             self.awake = False
+             console.print(Panel("[bold yellow]⏸ SHANEX STANDBY[/]", style="yellow"))
+-            tts.speak("Standing by, Sir. Say wake up Shanex.")
++            tts.speak("Standing by, Sir. Say wake up.")
+ 
+     def run(self):
+         """Main loop."""
+@@ -1080,7 +1074,7 @@ class JarvisController:
+             banner.add_row("║     Mode: Text (--text)              ║")
+         banner.add_row("║     Speed: -15% | Pitch: -10Hz       ║")
+         if stt:
+-            banner.add_row(f"║{'     Wake: "wake up Shanex"':<38}║")
++            banner.add_row(f"║{'     Wake: "wake up"':<38}║")
+         if SCREEN_CONTROL_AVAILABLE:
+             banner.add_row("║     Screen: OCR + Input Control      ║")
+         banner.add_row(f"║     Model: {OLLAMA_MODEL:<26}║")
+@@ -1098,7 +1092,7 @@ class JarvisController:
+ 
+         if stt is not None:
+             self.awake = False
+-            console.print('[dim]Say "wake up Shanex" to activate...[/dim]\n')
++            console.print('[dim]Say "wake up" to activate...[/dim]\n')
+         else:
+             self.awake = True
+             console.print("[dim]Text mode. Type 'sleep' for standby.[/dim]\n")
+diff --git a/tests/test_shanex.py b/tests/test_shanex.py
+index 4e182ef..9bdac9a 100644
+--- a/tests/test_shanex.py
++++ b/tests/test_shanex.py
+@@ -423,20 +423,19 @@ class TestSanitizeForMemory:
+ 
+ 
+ # ============================================================
+-# Wake phrase detection ("wake up Shanex")
++# Wake phrase detection ("wake up")
+ # ============================================================
+ 
+ class TestWakePhrase:
+     """is_wake_phrase() with plain strings - no mic, no model."""
+ 
+     @pytest.mark.parametrize("text", [
+-        "wake up Shanex",
+-        "Wake up, Shanex!",
+-        "WAKE UP SHANEX please",
+-        "wakeup shanex",
+-        "wake up shanks",      # common STT spelling
+-        "wake up Chanex",      # common STT spelling
+-        "hey wake up Shane X", # name split in two words
++        "wake up",
++        "Wake up!",
++        "WAKE UP",
++        "wakeup",
++        "wake-up",
++        "hey wake up",
+     ])
+     def test_accepts(self, text):
+         assert is_wake_phrase(text) is True
+@@ -444,18 +443,19 @@ class TestWakePhrase:
+     @pytest.mark.parametrize("text", [
+         "",
+         None,
+-        "hello Shanex",
+-        "wake up",
+-        "Shanex wake up",       # wrong order
++        "wake",
++        "up",
++        "up wake",              # wrong order
+         "wake me up later",
+         "what is the weather",
+-        "wake up Jarvis",       # old name no longer wakes the assistant
++        "I have to wake up early tomorrow morning",  # long sentence, not a command
+     ])
+     def test_rejects(self, text):
+         assert is_wake_phrase(text) is False
+ 
+-    def test_default_phrase_uses_new_name(self):
+-        assert main.WAKE_PHRASE == "wake up shanex"
++    def test_no_name_required(self):
++        assert is_wake_phrase("wake up") is True
++        assert main.WAKE_PHRASE == "wake up"
+ 
+ 
+ # ============================================================
+@@ -506,7 +506,7 @@ class TestWakeUp:
+         wakes, the reply is exactly "Wake up", and the LLM is never called."""
+         fake_stt = mock.MagicMock()
+         fake_stt.device = None
+-        fake_stt.listen.side_effect = ["what time is it", "wake up Shanex", KeyboardInterrupt()]
++        fake_stt.listen.side_effect = ["what time is it", "wake up", KeyboardInterrupt()]
+         fake_llm = mock.MagicMock()
+         fake_llm.is_cloud = True
+ 
+@@ -531,7 +531,7 @@ class TestWakeUp:
+         with mock.patch.object(main.tts, "speak") as speak:
+             ctrl.sleep()
+         said = speak.call_args.args[0]
+-        assert "Shanex" in said and "jarvis" not in said.lower()
++        assert said == "Standing by, Sir. Say wake up." and "jarvis" not in said.lower()
+         assert ctrl.awake is False
+ 
+ 
+@@ -545,9 +545,9 @@ class TestAssistantName:
+         for old in ("jarvis", "dexter"):
+             assert old not in main.SYSTEM_PROMPT.lower()
+ 
+-    def test_name_variants_do_not_include_old_name(self):
+-        assert "shanex" in main._WAKE_NAME_VARIANTS
+-        assert "jarvis" not in main._WAKE_NAME_VARIANTS
++    def test_wake_phrase_has_no_name(self):
++        for name in ("shanex", "jarvis"):
++            assert name not in main.WAKE_PHRASE.lower()
+ 
+ 
+ # ============================================================
+-- 
+2.43.0
+

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-JARVIS – a voice‑first CLI AI assistant (no GUI)
+Shanex – a voice‑first CLI AI assistant (no GUI)
 
 Features
 --------
-* Ollama LLM (official ollama python client) with Dexter Morgan persona
+* Ollama LLM (official ollama python client) with the Shanex persona
 * Speech‑to‑text via Moonshine Voice (offline, streaming, no length limit)
 * Text‑to‑speech:
-    - Primary: `edge-tts` (Microsoft neural voice, Dexter style)
+    - Primary: `edge-tts` (Microsoft neural voice)
     - Fallback: `gtts` + `pygame` mixer
 * Persistent conversation memory (`jarvis_memory.json`, chmod 600)
+* Personality + long-term facts from `shanex_personality_memory.json` (read-only,
+  validated; falls back to built-in defaults if missing or invalid)
 * Rich‑styled CLI (panels, spinners, log colours)
 * System control:
     - `open <url|ip|domain|search>` → webbrowser (IP/domain → http://)
@@ -20,11 +22,13 @@ Features
     - `press <key>` / `hotkey <k1> <k2>` → key input (y/N confirmation)
     - `scroll <n>` → scroll (y/N confirmation)
     - `speed <value>` → set voice speed
-* Voice wake phrase: say "wake up Jarvis" (STT-based, no clap detection)
-* Voice settings: Dexter Morgan style (dark, measured, slightly slower)
+* Voice wake phrase: say "wake up" (STT-based, no clap detection);
+  Shanex answers with exactly: Wake up
+* Voice settings: dark, measured, slightly slower
 * Privacy: command output / OCR / errors never stored in memory
 * Config via .env: OLLAMA_HOST, OLLAMA_MODEL, OLLAMA_API_KEY, OLLAMA_CONTEXT,
-  AUDIO_DEVICE, STT_LANGUAGE, MOONSHINE_ARCH, JARVIS_DRY_RUN
+  AUDIO_DEVICE, STT_LANGUAGE, MOONSHINE_ARCH, SHANEX_DRY_RUN
+  (the old JARVIS_DRY_RUN name is still accepted)
 * CLI flags: --text (keyboard), --offline, --debug, --selftest
 
 All code lives in this single file; just install the dependencies from
@@ -49,6 +53,7 @@ import threading
 import queue
 import shlex
 import re
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
@@ -82,7 +87,7 @@ try:
     SCREEN_CONTROL_AVAILABLE = True
 except (ImportError, SystemExit):
     # pyautogui's mouseinfo helper calls sys.exit() when tkinter is missing;
-    # treat that as "screen control unavailable" instead of killing JARVIS.
+    # treat that as "screen control unavailable" instead of killing Shanex.
     SCREEN_CONTROL_AVAILABLE = False
 
 # Microphone access (needed for voice mode)
@@ -106,6 +111,7 @@ ENV_PATH = SCRIPT_DIR / ".env"
 load_dotenv(ENV_PATH)  # load .env from the script directory, not cwd
 
 MEMORY_PATH = SCRIPT_DIR / "jarvis_memory.json"
+PERSONALITY_PATH = SCRIPT_DIR / os.getenv("SHANEX_PERSONALITY", "shanex_personality_memory.json")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")  # Required for https://ollama.com
@@ -115,28 +121,10 @@ STT_LANGUAGE = os.getenv("STT_LANGUAGE", "en")                      # en, ar, ..
 MOONSHINE_ARCH = os.getenv("MOONSHINE_ARCH", "TINY_STREAMING")      # TINY_STREAMING / BASE_STREAMING / SMALL_STREAMING
 MOONSHINE_UPDATE_INTERVAL = float(os.getenv("MOONSHINE_UPDATE_INTERVAL", "0.5"))
 STT_SAFETY_TIMEOUT = float(os.getenv("STT_SAFETY_TIMEOUT", "120"))  # hard cap only so a stuck mic cannot hang
-JARVIS_DRY_RUN = os.getenv("JARVIS_DRY_RUN") in ("1", "true", "yes", "on")
+SHANEX_DRY_RUN = (os.getenv("SHANEX_DRY_RUN") or os.getenv("JARVIS_DRY_RUN")) in ("1", "true", "yes", "on")
 
 # Runtime flags (set by argparse in main())
 ARGS = None  # will hold parsed args
-
-# Dexter Morgan persona - dark, measured, precise
-SYSTEM_PROMPT = (
-    "You are Dexter Morgan's inner voice - an AI assistant with his precise, "
-    "measured, slightly dark demeanor. You speak with clinical efficiency, "
-    "moral ambiguity, and a hint of the Dark Passenger. Address the user as "
-    "'Sir' or by name. Keep responses concise, direct, and occasionally "
-    "philosophical about the nature of control and chaos. Never use exclamation "
-    "points. Speak in low, even tones. You are not friendly - you are useful."
-)
-
-# Dexter-style voice settings (using edge-tts voices that sound darker)
-DEXTER_VOICE = "en-GB-RyanNeural"  # Deep British male - closest to Dexter
-DEXTER_SPEED = "-15%"              # Slower, more deliberate
-DEXTER_PITCH = "-10Hz"             # Lower pitch (edge-tts uses Hz)
-
-# Voice speed control (user adjustable)
-current_speed = DEXTER_SPEED
 
 # Late-initialized singletons (set in main())
 stt = None
@@ -144,18 +132,18 @@ tts = None
 screen = None
 llm = None
 
-# Dexter Morgan persona - dark, measured, precise
+# Shanex persona - dark, measured, precise
 SYSTEM_PROMPT = (
-    "You are Dexter Morgan's inner voice - an AI assistant with his precise, "
-    "measured, slightly dark demeanor. You speak with clinical efficiency, "
-    "moral ambiguity, and a hint of the Dark Passenger. Address the user as "
+    "You are Shanex - an AI assistant with a precise, "
+    "measured, slightly dark demeanor. You speak with clinical efficiency "
+    "and moral ambiguity. Address the user as "
     "'Sir' or by name. Keep responses concise, direct, and occasionally "
     "philosophical about the nature of control and chaos. Never use exclamation "
     "points. Speak in low, even tones. You are not friendly - you are useful."
 )
 
-# Dexter-style voice settings (using edge-tts voices that sound darker)
-DEXTER_VOICE = "en-GB-RyanNeural"  # Deep British male - closest to Dexter
+# Voice settings (using edge-tts voices that sound darker)
+DEXTER_VOICE = "en-GB-RyanNeural"  # Deep British male
 DEXTER_SPEED = "-15%"              # Slower, more deliberate
 DEXTER_PITCH = "-10Hz"             # Lower pitch (edge-tts uses Hz)
 
@@ -177,6 +165,16 @@ class Memory:
         self.path = path
         self.history: List[Dict[str, Any]] = self._load()
 
+    def _backup_unreadable(self) -> None:
+        """Copy an unreadable history file aside so the next dump() cannot destroy it."""
+        try:
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            backup = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
+            shutil.copy2(self.path, backup)
+            console.log(f"[yellow]Original saved as {backup.name}[/]")
+        except Exception:
+            pass
+
     def _load(self) -> List[Dict[str, Any]]:
         if self.path.is_file():
             try:
@@ -184,7 +182,9 @@ class Memory:
                 if isinstance(data, list):
                     return data
             except Exception:
-                console.log("[red]Failed to read memory, starting fresh[/]")
+                pass
+            console.log("[red]Failed to read memory, starting fresh[/]")
+            self._backup_unreadable()
         return []
 
     def add(self, role: str, content: str) -> None:
@@ -212,30 +212,234 @@ class Memory:
 memory = Memory(MEMORY_PATH)
 
 # ----------------------------------------------------------------------
-# Wake phrase: "wake up Jarvis"
+# Personality + long-term facts (shanex_personality_memory.json)
+#
+# This file is CONFIGURATION, not chat history: it is only ever read, never
+# written by the app. A missing or invalid file falls back to the built-in
+# prompt above, so Shanex always starts.
 # ----------------------------------------------------------------------
-WAKE_PHRASE = os.getenv("WAKE_PHRASE", "wake up jarvis")
-_WAKE_NAME_VARIANTS = ("jarvis", "jarvus", "jarvas", "jarvice", "service", "jarvist", "charvis", "jervis", "travis")
+DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPT
+DEFAULT_HISTORY_TURNS = 20
+PERSONALITY_MAX_BYTES = 64 * 1024
+_PERSONALITY_SCHEMA_VERSION = 1
+
+
+def _is_text_list(value, max_items: int, max_len: int) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) <= max_items
+        and all(isinstance(x, str) and x.strip() and len(x) <= max_len for x in value)
+    )
+
+
+def validate_personality(data: Any) -> Tuple[List[str], List[str]]:
+    """Check the structure of the personality JSON.
+
+    Returns (errors, warnings). Any error means the file is not used.
+    Unknown keys are ignored so newer files stay readable.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    if not isinstance(data, dict):
+        return ["top level must be a JSON object"], warnings
+
+    ver = data.get("schema_version", 1)
+    if not isinstance(ver, int) or isinstance(ver, bool) or ver < 1:
+        errors.append("schema_version must be a positive integer")
+    elif ver > _PERSONALITY_SCHEMA_VERSION:
+        errors.append(f"schema_version {ver} is newer than supported ({_PERSONALITY_SCHEMA_VERSION})")
+
+    ident = data.get("identity")
+    if not isinstance(ident, dict):
+        errors.append("identity is required and must be an object")
+    else:
+        name = ident.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name) > 40:
+            errors.append("identity.name must be a non-empty string (max 40 chars)")
+        for key in ("role", "creator"):
+            if key in ident and (not isinstance(ident[key], str) or len(ident[key]) > 200):
+                errors.append(f"identity.{key} must be a string (max 200 chars)")
+
+    pers = data.get("personality", {})
+    if not isinstance(pers, dict):
+        errors.append("personality must be an object")
+    else:
+        if "traits" in pers and not _is_text_list(pers["traits"], 20, 60):
+            errors.append("personality.traits must be a list of short strings")
+        if "style_rules" in pers and not _is_text_list(pers["style_rules"], 30, 300):
+            errors.append("personality.style_rules must be a list of strings (max 300 chars each)")
+        if "address_user_as" in pers and (
+            not isinstance(pers["address_user_as"], str) or len(pers["address_user_as"]) > 40
+        ):
+            errors.append("personality.address_user_as must be a short string")
+
+    beh = data.get("behavior", {})
+    if not isinstance(beh, dict):
+        errors.append("behavior must be an object")
+    elif "rules" in beh and not _is_text_list(beh["rules"], 30, 300):
+        errors.append("behavior.rules must be a list of strings (max 300 chars each)")
+
+    prof = data.get("user_profile", {})
+    if not isinstance(prof, dict):
+        errors.append("user_profile must be an object")
+    else:
+        if "name" in prof and (not isinstance(prof["name"], str) or len(prof["name"]) > 60):
+            errors.append("user_profile.name must be a short string")
+        if "facts" in prof and not _is_text_list(prof["facts"], 40, 300):
+            errors.append("user_profile.facts must be a list of strings (max 300 chars each)")
+
+    ltm = data.get("long_term_memory", {})
+    if not isinstance(ltm, dict):
+        errors.append("long_term_memory must be an object")
+    elif "facts" in ltm and not _is_text_list(ltm["facts"], 100, 300):
+        errors.append("long_term_memory.facts must be a list of strings (max 300 chars each)")
+
+    mem = data.get("memory", {})
+    if not isinstance(mem, dict):
+        errors.append("memory must be an object")
+    else:
+        turns = mem.get("history_turns_sent", DEFAULT_HISTORY_TURNS)
+        if not isinstance(turns, int) or isinstance(turns, bool) or not 1 <= turns <= 100:
+            errors.append("memory.history_turns_sent must be an integer from 1 to 100")
+        budget = mem.get("prompt_char_budget", 2400)
+        if not isinstance(budget, int) or isinstance(budget, bool) or not 400 <= budget <= 8000:
+            errors.append("memory.prompt_char_budget must be an integer from 400 to 8000")
+
+    if "wake_response" in data or "wake" in data:
+        warnings.append("wake settings are ignored: the wake-up reply is fixed in code as exactly 'Wake up'")
+    return errors, warnings
+
+
+def load_personality(path: Path) -> Dict[str, Any]:
+    """Read + validate the personality file. Never raises, never writes.
+
+    Returns {"config": dict|None, "status": "loaded"|"missing"|"invalid",
+             "errors": [...], "warnings": [...], "path": str}.
+    """
+    result: Dict[str, Any] = {"config": None, "status": "missing", "errors": [], "warnings": [], "path": str(path)}
+    try:
+        if not path.is_file():
+            return result
+        if path.stat().st_size > PERSONALITY_MAX_BYTES:
+            result.update(status="invalid", errors=[f"file is larger than {PERSONALITY_MAX_BYTES // 1024} KB"])
+            return result
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        result.update(status="invalid", errors=[f"cannot read JSON: {exc}"])
+        return result
+    errors, warnings = validate_personality(data)
+    result["warnings"] = warnings
+    if errors:
+        result.update(status="invalid", errors=errors)
+    else:
+        result.update(status="loaded", config=data)
+    return result
+
+
+def _clean(text: str) -> str:
+    """One line, no control characters."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(text)).strip()
+
+
+def build_system_prompt(cfg: Dict[str, Any]) -> str:
+    """Compose the LLM system prompt from a validated personality config.
+
+    Identity, style and behavior rules are always kept. If the prompt would
+    exceed memory.prompt_char_budget (small models have a tiny context window),
+    long-term facts are dropped first, then user-profile facts, from the end.
+    """
+    ident = cfg["identity"]
+    pers = cfg.get("personality", {})
+    beh = cfg.get("behavior", {})
+    prof = cfg.get("user_profile", {})
+    ltm = cfg.get("long_term_memory", {})
+    budget = cfg.get("memory", {}).get("prompt_char_budget", 2400)
+
+    head = f"You are {_clean(ident['name'])}"
+    if ident.get("role"):
+        head += f", {_clean(ident['role'])}"
+    head += "."
+    if ident.get("creator"):
+        head += f" You were created by {_clean(ident['creator'])}."
+    if pers.get("traits"):
+        head += " Personality: " + ", ".join(_clean(t) for t in pers["traits"]) + "."
+    if pers.get("address_user_as"):
+        head += f" Address the user as '{_clean(pers['address_user_as'])}' or by name."
+
+    fixed = [head]
+    if pers.get("style_rules"):
+        fixed += ["Style:"] + [f"- {_clean(r)}" for r in pers["style_rules"]]
+    if beh.get("rules"):
+        fixed += ["Behavior:"] + [f"- {_clean(r)}" for r in beh["rules"]]
+
+    user_lines = [f"- {_clean(f)}" for f in prof.get("facts", [])]
+    if prof.get("name"):
+        user_lines.insert(0, f"- The user's name is {_clean(prof['name'])}.")
+    fact_lines = [f"- {_clean(f)}" for f in ltm.get("facts", [])]
+
+    def render() -> str:
+        parts = list(fixed)
+        if user_lines:
+            parts += ["About the user:"] + user_lines
+        if fact_lines:
+            parts += ["Background facts:"] + fact_lines
+        return "\n".join(parts)
+
+    text = render()
+    while len(text) > budget and (fact_lines or user_lines):
+        (fact_lines or user_lines).pop()
+        text = render()
+    return text
+
+
+PERSONALITY_RESULT = load_personality(PERSONALITY_PATH)
+PERSONALITY = PERSONALITY_RESULT["config"]  # dict when loaded, else None
+if PERSONALITY is not None:
+    SYSTEM_PROMPT = build_system_prompt(PERSONALITY)
+    HISTORY_TURNS = PERSONALITY.get("memory", {}).get("history_turns_sent", DEFAULT_HISTORY_TURNS)
+else:
+    SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+    HISTORY_TURNS = DEFAULT_HISTORY_TURNS
+if PERSONALITY_RESULT["status"] == "invalid":
+    console.log(
+        f"[yellow]Personality file ignored ({'; '.join(PERSONALITY_RESULT['errors'])}); using built-in defaults[/]"
+    )
+for _w in PERSONALITY_RESULT["warnings"]:
+    console.log(f"[yellow]Personality file: {_w}[/]")
+
+
+def personality_status_line() -> str:
+    """One-line, human-readable status shown at startup."""
+    name = Path(PERSONALITY_RESULT["path"]).name
+    if PERSONALITY_RESULT["status"] == "loaded":
+        return f"[dim]Personality: {name} loaded[/dim]"
+    if PERSONALITY_RESULT["status"] == "missing":
+        return f"[dim]Personality: {name} not found - using built-in defaults[/dim]"
+    return f"[yellow]Personality: {name} is invalid - using built-in defaults[/yellow]"
+
+
+# ----------------------------------------------------------------------
+# Wake phrase: "wake up"  ->  spoken reply: "Wake up" (nothing else)
+# ----------------------------------------------------------------------
+WAKE_PHRASE = "wake up"
+# Exactly what Shanex says when the wake phrase is detected. Do not add words.
+WAKE_RESPONSE = "Wake up"
+# Standby ignores long sentences, so a casual "I have to wake up early" does not trigger it.
+WAKE_MAX_WORDS = 5
 
 
 def is_wake_phrase(text: str) -> bool:
-    """True if `text` sounds like 'wake up Jarvis'.
+    """True if `text` is the wake phrase "wake up" (no name needed).
 
-    Tolerant on purpose: speech-to-text often spells the name differently
-    ('Jarvus', 'Jervis'...), so we need 'wake' + 'up' and any known variant of
-    the name, in that order, anywhere in the sentence.
+    Accepts "wake up", "wakeup", "wake-up" and short variants such as
+    "hey wake up" - but only for short utterances (<= WAKE_MAX_WORDS words).
     """
     words = re.findall(r"[a-z']+", (text or "").lower())
-    if len(words) < 2:
+    if not words or len(words) > WAKE_MAX_WORDS:
         return False
-    for i, w in enumerate(words):
-        if w in ("wake", "wakeup", "wait") and i + 1 < len(words):
-            rest = words[i + 1:]
-            if w == "wakeup":
-                return any(v in rest for v in _WAKE_NAME_VARIANTS)
-            if rest[0] == "up" and any(v in rest[1:] for v in _WAKE_NAME_VARIANTS):
-                return True
-    return False
+    if "wakeup" in words:
+        return True
+    return any(w == "wake" and words[i + 1] == "up" for i, w in enumerate(words[:-1]))
 
 # ----------------------------------------------------------------------
 # Speech-to-Text (offline Moonshine, streaming)
@@ -248,7 +452,7 @@ class MoonshineSTT:
 
     The microphone stays open only while ``listen()`` runs, so the device is
     free between utterances. ``mute()`` drops audio without closing the mic;
-    it is used around TTS so JARVIS never transcribes its own voice.
+    it is used around TTS so Shanex never transcribes its own voice.
     """
 
     def __init__(self, lang: str = "en", device: Optional[int] = None):
@@ -554,7 +758,7 @@ class TTS:
     def speak(self, text: str) -> None:
         """Public wrapper - runs async Edge-TTS.
 
-        The STT is muted for the whole utterance so JARVIS never transcribes
+        The STT is muted for the whole utterance so Shanex never transcribes
         its own voice.
         """
         stt_ref = stt  # module-level singleton; None in --text mode
@@ -696,7 +900,7 @@ class OllamaLLM:
         user turn to memory BEFORE calling ask(), so we exclude the last
         entry if it matches the current user message to avoid duplication.
         """
-        recent = memory.recent(20)
+        recent = memory.recent(HISTORY_TURNS)
         # Exclude last entry if it's the current user message (already added by caller)
         if recent and recent[-1].get("role") == "user" and recent[-1].get("content") == user_msg:
             recent = recent[:-1]
@@ -1036,7 +1240,7 @@ class JarvisController:
     """Main controller with wake/sleep state machine."""
 
     def __init__(self):
-        # Voice mode starts in standby and waits for "wake up Jarvis".
+        # Voice mode starts in standby and waits for "wake up".
         # Text mode (no STT) is always awake.
         self.awake = stt is None
 
@@ -1044,20 +1248,20 @@ class JarvisController:
         """Called when the wake phrase is heard.
 
         The greeting is spoken BEFORE we set awake=True, so the state machine
-        never considers JARVIS awake while the speaker is still busy.
+        never considers Shanex awake while the speaker is still busy.
         """
         if self.awake:
             return
-        console.print(Panel("[bold green]▶ JARVIS ONLINE[/]", style="green"))
-        tts.speak("Systems online, Sir.")
+        console.print(Panel("[bold green]▶ SHANEX ONLINE[/]", style="green"))
+        tts.speak(WAKE_RESPONSE)
         self.awake = True
 
     def sleep(self):
-        """Put JARVIS to sleep."""
+        """Put Shanex to sleep."""
         if self.awake:
             self.awake = False
-            console.print(Panel("[bold yellow]⏸ JARVIS STANDBY[/]", style="yellow"))
-            tts.speak("Standing by, Sir. Say wake up Jarvis.")
+            console.print(Panel("[bold yellow]⏸ SHANEX STANDBY[/]", style="yellow"))
+            tts.speak("Standing by, Sir. Say wake up.")
 
     def run(self):
         """Main loop."""
@@ -1067,20 +1271,21 @@ class JarvisController:
         banner = Table.grid(padding=1)
         banner.add_column(style="bold magenta", justify="center")
         banner.add_row("╔══════════════════════════════════════╗")
-        banner.add_row("║       JARVIS - DEXTER PROTOCOL       ║")
+        banner.add_row(f"║{'SHANEX':^38}║")
         banner.add_row("║     Voice: en-GB-RyanNeural          ║")
         if stt:
-            banner.add_row(f"║     Mic: {_input_device_name(stt.device):<29}║")
+            banner.add_row(f"║     Mic: {_input_device_name(stt.device):<28}║")
         else:
             banner.add_row("║     Mode: Text (--text)              ║")
         banner.add_row("║     Speed: -15% | Pitch: -10Hz       ║")
         if stt:
-            banner.add_row("║     Wake: \"wake up Jarvis\"          ║")
+            banner.add_row(f"║{'     Wake: "wake up"':<38}║")
         if SCREEN_CONTROL_AVAILABLE:
             banner.add_row("║     Screen: OCR + Input Control      ║")
-        banner.add_row(f"║     Model: {OLLAMA_MODEL:<27}║")
+        banner.add_row(f"║     Model: {OLLAMA_MODEL:<26}║")
         banner.add_row("╚══════════════════════════════════════╝")
         console.print(Panel(banner, expand=False))
+        console.print(personality_status_line())
 
         # Warm up the local Ollama model so the first real response is fast.
         # Skipped on Ollama Cloud - a warm-up chat burns free quota.
@@ -1093,7 +1298,7 @@ class JarvisController:
 
         if stt is not None:
             self.awake = False
-            console.print('[dim]Say "wake up Jarvis" to activate...[/dim]\n')
+            console.print('[dim]Say "wake up" to activate...[/dim]\n')
         else:
             self.awake = True
             console.print("[dim]Text mode. Type 'sleep' for standby.[/dim]\n")
@@ -1149,7 +1354,7 @@ class JarvisController:
                         memory.dump()
                         continue
 
-                    console.print(Panel(command_reply, title="[cyan]JARVIS (command)[/]", subtitle="[OK]"))
+                    console.print(Panel(command_reply, title="[cyan]SHANEX (command)[/]", subtitle="[OK]"))
                     tts.speak(command_reply)
                     memory.add("assistant", sanitize_for_memory(command_reply))
                     memory.dump()
@@ -1164,7 +1369,7 @@ class JarvisController:
                         response = "I cannot reach the model right now, Sir."
 
                 # 6. Show + speak the answer
-                console.print(Panel(response, title="[cyan]JARVIS[/]", subtitle="[IDEA]"))
+                console.print(Panel(response, title="[cyan]SHANEX[/]", subtitle="[IDEA]"))
                 tts.speak(response)
 
                 # 7. Persist turn (sanitized)
@@ -1184,7 +1389,7 @@ class JarvisController:
 def parse_args():
     import argparse
     ap = argparse.ArgumentParser(
-        description="JARVIS – Dexter-style voice assistant",
+        description="Shanex – voice assistant",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--text", action="store_true",
@@ -1194,7 +1399,7 @@ def parse_args():
     ap.add_argument("--offline", action="store_true",
                     help="Skip all network calls (Ollama, edge-tts)")
     ap.add_argument("--debug", action="store_true",
-                    help="Enable debug logging to jarvis.log")
+                    help="Debug flag (reserved - currently has no effect)")
     return ap.parse_args()
 
 
@@ -1239,7 +1444,7 @@ def run_selftest(args):
     from rich.table import Table
 
     console.clear()
-    console.print(Panel("[bold magenta]JARVIS SELF-TEST[/]", expand=False))
+    console.print(Panel("[bold magenta]SHANEX SELF-TEST[/]", expand=False))
 
     results = []
 

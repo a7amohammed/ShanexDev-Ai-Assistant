@@ -1,0 +1,672 @@
+From 876d8116ab1d38120434569eda0f75da80dafc49 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 09:47:08 +0000
+Subject: [PATCH 3/3] Add shanex_personality_memory.json: validated personality
+ config, prompt built from file, safe history backup
+
+---
+ README.md                      |  12 ++
+ main.py                        | 246 ++++++++++++++++++++++++++++++---
+ shanex_personality_memory.json |  57 ++++++++
+ tests/test_personality.py      | 235 +++++++++++++++++++++++++++++++
+ 4 files changed, 530 insertions(+), 20 deletions(-)
+ create mode 100644 shanex_personality_memory.json
+ create mode 100644 tests/test_personality.py
+
+diff --git a/README.md b/README.md
+index 70b0873..a14cc34 100644
+--- a/README.md
++++ b/README.md
+@@ -42,6 +42,16 @@ A voice-first CLI AI assistant. Say **"wake up"** and it answers **"Wake up"**.
+ - `sleep` / `standby` - Returns to standby (waiting for the wake phrase)
+ - `exit` / `quit` - Terminates Shanex
+ 
++### 🧬 **Personality & Long-Term Memory (`shanex_personality_memory.json`)**
++- One JSON file next to `main.py` defines Shanex's name, style rules, behavior rules, facts about the user and background facts. Edit it by hand - no code changes needed.
++- It is **configuration, not chat history**: the app only reads it and never writes to it. Chat history stays in `jarvis_memory.json`.
++- It is validated at startup. If the file is missing or invalid, Shanex starts with the built-in personality and prints why. The startup line `Personality: ... loaded` confirms the file is in use.
++- `memory.prompt_char_budget` caps the prompt size (long-term facts are dropped first), and `memory.history_turns_sent` sets how many past messages are sent to the model. Lower both for small local models.
++- Use another file with `SHANEX_PERSONALITY=other.json` in `.env`.
++- The wake-up reply is fixed in code as exactly `Wake up` and cannot be changed from this file.
++- Do not put API keys or passwords in it.
++- A history file that cannot be read is copied to `jarvis_memory.json.corrupt-<timestamp>` before it is replaced, so conversations are not lost.
++
+ ### 🧠 **AI Brain**
+ - Ollama (local, or Ollama Cloud with `OLLAMA_HOST=https://ollama.com` + `OLLAMA_API_KEY`)
+ - Persistent conversation memory (`jarvis_memory.json` - file name kept so existing memory keeps working)
+@@ -70,6 +80,7 @@ OLLAMA_MODEL=llama3.2:1b
+ # MOONSHINE_ARCH=TINY_STREAMING
+ # STT_SAFETY_TIMEOUT=120    # hard cap in seconds so a stuck mic cannot hang
+ # AUDIO_DEVICE=             # index or name substring
++# SHANEX_PERSONALITY=shanex_personality_memory.json
+ # SHANEX_DRY_RUN=1          # (the old JARVIS_DRY_RUN name is still accepted)
+ ```
+ 
+@@ -122,6 +133,7 @@ python3 main.py --selftest # self-check
+ ```
+ main.py
+ ├── Memory            - Persistent JSON conversation history
++├── load_personality  - Reads + validates shanex_personality_memory.json
+ ├── MoonshineSTT      - Offline streaming speech recognition
+ ├── is_wake_phrase()  - "wake up" matcher
+ ├── TTS               - Edge-TTS + gTTS fallback
+diff --git a/main.py b/main.py
+index 610af9d..5485769 100644
+--- a/main.py
++++ b/main.py
+@@ -10,6 +10,8 @@ Features
+     - Primary: `edge-tts` (Microsoft neural voice)
+     - Fallback: `gtts` + `pygame` mixer
+ * Persistent conversation memory (`jarvis_memory.json`, chmod 600)
++* Personality + long-term facts from `shanex_personality_memory.json` (read-only,
++  validated; falls back to built-in defaults if missing or invalid)
+ * Rich‑styled CLI (panels, spinners, log colours)
+ * System control:
+     - `open <url|ip|domain|search>` → webbrowser (IP/domain → http://)
+@@ -51,6 +53,7 @@ import threading
+ import queue
+ import shlex
+ import re
++import shutil
+ from pathlib import Path
+ from datetime import datetime, timezone
+ from typing import List, Dict, Any, Optional, Tuple
+@@ -108,6 +111,7 @@ ENV_PATH = SCRIPT_DIR / ".env"
+ load_dotenv(ENV_PATH)  # load .env from the script directory, not cwd
+ 
+ MEMORY_PATH = SCRIPT_DIR / "jarvis_memory.json"
++PERSONALITY_PATH = SCRIPT_DIR / os.getenv("SHANEX_PERSONALITY", "shanex_personality_memory.json")
+ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+ OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")  # Required for https://ollama.com
+@@ -122,24 +126,6 @@ SHANEX_DRY_RUN = (os.getenv("SHANEX_DRY_RUN") or os.getenv("JARVIS_DRY_RUN")) in
+ # Runtime flags (set by argparse in main())
+ ARGS = None  # will hold parsed args
+ 
+-# Shanex persona - dark, measured, precise
+-SYSTEM_PROMPT = (
+-    "You are Shanex - an AI assistant with a precise, "
+-    "measured, slightly dark demeanor. You speak with clinical efficiency "
+-    "and moral ambiguity. Address the user as "
+-    "'Sir' or by name. Keep responses concise, direct, and occasionally "
+-    "philosophical about the nature of control and chaos. Never use exclamation "
+-    "points. Speak in low, even tones. You are not friendly - you are useful."
+-)
+-
+-# Voice settings (using edge-tts voices that sound darker)
+-DEXTER_VOICE = "en-GB-RyanNeural"  # Deep British male
+-DEXTER_SPEED = "-15%"              # Slower, more deliberate
+-DEXTER_PITCH = "-10Hz"             # Lower pitch (edge-tts uses Hz)
+-
+-# Voice speed control (user adjustable)
+-current_speed = DEXTER_SPEED
+-
+ # Late-initialized singletons (set in main())
+ stt = None
+ tts = None
+@@ -179,6 +165,16 @@ class Memory:
+         self.path = path
+         self.history: List[Dict[str, Any]] = self._load()
+ 
++    def _backup_unreadable(self) -> None:
++        """Copy an unreadable history file aside so the next dump() cannot destroy it."""
++        try:
++            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
++            backup = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
++            shutil.copy2(self.path, backup)
++            console.log(f"[yellow]Original saved as {backup.name}[/]")
++        except Exception:
++            pass
++
+     def _load(self) -> List[Dict[str, Any]]:
+         if self.path.is_file():
+             try:
+@@ -186,7 +182,9 @@ class Memory:
+                 if isinstance(data, list):
+                     return data
+             except Exception:
+-                console.log("[red]Failed to read memory, starting fresh[/]")
++                pass
++            console.log("[red]Failed to read memory, starting fresh[/]")
++            self._backup_unreadable()
+         return []
+ 
+     def add(self, role: str, content: str) -> None:
+@@ -213,6 +211,213 @@ class Memory:
+ 
+ memory = Memory(MEMORY_PATH)
+ 
++# ----------------------------------------------------------------------
++# Personality + long-term facts (shanex_personality_memory.json)
++#
++# This file is CONFIGURATION, not chat history: it is only ever read, never
++# written by the app. A missing or invalid file falls back to the built-in
++# prompt above, so Shanex always starts.
++# ----------------------------------------------------------------------
++DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPT
++DEFAULT_HISTORY_TURNS = 20
++PERSONALITY_MAX_BYTES = 64 * 1024
++_PERSONALITY_SCHEMA_VERSION = 1
++
++
++def _is_text_list(value, max_items: int, max_len: int) -> bool:
++    return (
++        isinstance(value, list)
++        and len(value) <= max_items
++        and all(isinstance(x, str) and x.strip() and len(x) <= max_len for x in value)
++    )
++
++
++def validate_personality(data: Any) -> Tuple[List[str], List[str]]:
++    """Check the structure of the personality JSON.
++
++    Returns (errors, warnings). Any error means the file is not used.
++    Unknown keys are ignored so newer files stay readable.
++    """
++    errors: List[str] = []
++    warnings: List[str] = []
++    if not isinstance(data, dict):
++        return ["top level must be a JSON object"], warnings
++
++    ver = data.get("schema_version", 1)
++    if not isinstance(ver, int) or isinstance(ver, bool) or ver < 1:
++        errors.append("schema_version must be a positive integer")
++    elif ver > _PERSONALITY_SCHEMA_VERSION:
++        errors.append(f"schema_version {ver} is newer than supported ({_PERSONALITY_SCHEMA_VERSION})")
++
++    ident = data.get("identity")
++    if not isinstance(ident, dict):
++        errors.append("identity is required and must be an object")
++    else:
++        name = ident.get("name")
++        if not isinstance(name, str) or not name.strip() or len(name) > 40:
++            errors.append("identity.name must be a non-empty string (max 40 chars)")
++        for key in ("role", "creator"):
++            if key in ident and (not isinstance(ident[key], str) or len(ident[key]) > 200):
++                errors.append(f"identity.{key} must be a string (max 200 chars)")
++
++    pers = data.get("personality", {})
++    if not isinstance(pers, dict):
++        errors.append("personality must be an object")
++    else:
++        if "traits" in pers and not _is_text_list(pers["traits"], 20, 60):
++            errors.append("personality.traits must be a list of short strings")
++        if "style_rules" in pers and not _is_text_list(pers["style_rules"], 30, 300):
++            errors.append("personality.style_rules must be a list of strings (max 300 chars each)")
++        if "address_user_as" in pers and (
++            not isinstance(pers["address_user_as"], str) or len(pers["address_user_as"]) > 40
++        ):
++            errors.append("personality.address_user_as must be a short string")
++
++    beh = data.get("behavior", {})
++    if not isinstance(beh, dict):
++        errors.append("behavior must be an object")
++    elif "rules" in beh and not _is_text_list(beh["rules"], 30, 300):
++        errors.append("behavior.rules must be a list of strings (max 300 chars each)")
++
++    prof = data.get("user_profile", {})
++    if not isinstance(prof, dict):
++        errors.append("user_profile must be an object")
++    else:
++        if "name" in prof and (not isinstance(prof["name"], str) or len(prof["name"]) > 60):
++            errors.append("user_profile.name must be a short string")
++        if "facts" in prof and not _is_text_list(prof["facts"], 40, 300):
++            errors.append("user_profile.facts must be a list of strings (max 300 chars each)")
++
++    ltm = data.get("long_term_memory", {})
++    if not isinstance(ltm, dict):
++        errors.append("long_term_memory must be an object")
++    elif "facts" in ltm and not _is_text_list(ltm["facts"], 100, 300):
++        errors.append("long_term_memory.facts must be a list of strings (max 300 chars each)")
++
++    mem = data.get("memory", {})
++    if not isinstance(mem, dict):
++        errors.append("memory must be an object")
++    else:
++        turns = mem.get("history_turns_sent", DEFAULT_HISTORY_TURNS)
++        if not isinstance(turns, int) or isinstance(turns, bool) or not 1 <= turns <= 100:
++            errors.append("memory.history_turns_sent must be an integer from 1 to 100")
++        budget = mem.get("prompt_char_budget", 2400)
++        if not isinstance(budget, int) or isinstance(budget, bool) or not 400 <= budget <= 8000:
++            errors.append("memory.prompt_char_budget must be an integer from 400 to 8000")
++
++    if "wake_response" in data or "wake" in data:
++        warnings.append("wake settings are ignored: the wake-up reply is fixed in code as exactly 'Wake up'")
++    return errors, warnings
++
++
++def load_personality(path: Path) -> Dict[str, Any]:
++    """Read + validate the personality file. Never raises, never writes.
++
++    Returns {"config": dict|None, "status": "loaded"|"missing"|"invalid",
++             "errors": [...], "warnings": [...], "path": str}.
++    """
++    result: Dict[str, Any] = {"config": None, "status": "missing", "errors": [], "warnings": [], "path": str(path)}
++    try:
++        if not path.is_file():
++            return result
++        if path.stat().st_size > PERSONALITY_MAX_BYTES:
++            result.update(status="invalid", errors=[f"file is larger than {PERSONALITY_MAX_BYTES // 1024} KB"])
++            return result
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except Exception as exc:
++        result.update(status="invalid", errors=[f"cannot read JSON: {exc}"])
++        return result
++    errors, warnings = validate_personality(data)
++    result["warnings"] = warnings
++    if errors:
++        result.update(status="invalid", errors=errors)
++    else:
++        result.update(status="loaded", config=data)
++    return result
++
++
++def _clean(text: str) -> str:
++    """One line, no control characters."""
++    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(text)).strip()
++
++
++def build_system_prompt(cfg: Dict[str, Any]) -> str:
++    """Compose the LLM system prompt from a validated personality config.
++
++    Identity, style and behavior rules are always kept. If the prompt would
++    exceed memory.prompt_char_budget (small models have a tiny context window),
++    long-term facts are dropped first, then user-profile facts, from the end.
++    """
++    ident = cfg["identity"]
++    pers = cfg.get("personality", {})
++    beh = cfg.get("behavior", {})
++    prof = cfg.get("user_profile", {})
++    ltm = cfg.get("long_term_memory", {})
++    budget = cfg.get("memory", {}).get("prompt_char_budget", 2400)
++
++    head = f"You are {_clean(ident['name'])}"
++    if ident.get("role"):
++        head += f", {_clean(ident['role'])}"
++    head += "."
++    if ident.get("creator"):
++        head += f" You were created by {_clean(ident['creator'])}."
++    if pers.get("traits"):
++        head += " Personality: " + ", ".join(_clean(t) for t in pers["traits"]) + "."
++    if pers.get("address_user_as"):
++        head += f" Address the user as '{_clean(pers['address_user_as'])}' or by name."
++
++    fixed = [head]
++    if pers.get("style_rules"):
++        fixed += ["Style:"] + [f"- {_clean(r)}" for r in pers["style_rules"]]
++    if beh.get("rules"):
++        fixed += ["Behavior:"] + [f"- {_clean(r)}" for r in beh["rules"]]
++
++    user_lines = [f"- {_clean(f)}" for f in prof.get("facts", [])]
++    if prof.get("name"):
++        user_lines.insert(0, f"- The user's name is {_clean(prof['name'])}.")
++    fact_lines = [f"- {_clean(f)}" for f in ltm.get("facts", [])]
++
++    def render() -> str:
++        parts = list(fixed)
++        if user_lines:
++            parts += ["About the user:"] + user_lines
++        if fact_lines:
++            parts += ["Background facts:"] + fact_lines
++        return "\n".join(parts)
++
++    text = render()
++    while len(text) > budget and (fact_lines or user_lines):
++        (fact_lines or user_lines).pop()
++        text = render()
++    return text
++
++
++PERSONALITY_RESULT = load_personality(PERSONALITY_PATH)
++PERSONALITY = PERSONALITY_RESULT["config"]  # dict when loaded, else None
++if PERSONALITY is not None:
++    SYSTEM_PROMPT = build_system_prompt(PERSONALITY)
++    HISTORY_TURNS = PERSONALITY.get("memory", {}).get("history_turns_sent", DEFAULT_HISTORY_TURNS)
++else:
++    SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
++    HISTORY_TURNS = DEFAULT_HISTORY_TURNS
++if PERSONALITY_RESULT["status"] == "invalid":
++    console.log(
++        f"[yellow]Personality file ignored ({'; '.join(PERSONALITY_RESULT['errors'])}); using built-in defaults[/]"
++    )
++for _w in PERSONALITY_RESULT["warnings"]:
++    console.log(f"[yellow]Personality file: {_w}[/]")
++
++
++def personality_status_line() -> str:
++    """One-line, human-readable status shown at startup."""
++    name = Path(PERSONALITY_RESULT["path"]).name
++    if PERSONALITY_RESULT["status"] == "loaded":
++        return f"[dim]Personality: {name} loaded[/dim]"
++    if PERSONALITY_RESULT["status"] == "missing":
++        return f"[dim]Personality: {name} not found - using built-in defaults[/dim]"
++    return f"[yellow]Personality: {name} is invalid - using built-in defaults[/yellow]"
++
++
+ # ----------------------------------------------------------------------
+ # Wake phrase: "wake up"  ->  spoken reply: "Wake up" (nothing else)
+ # ----------------------------------------------------------------------
+@@ -695,7 +900,7 @@ class OllamaLLM:
+         user turn to memory BEFORE calling ask(), so we exclude the last
+         entry if it matches the current user message to avoid duplication.
+         """
+-        recent = memory.recent(20)
++        recent = memory.recent(HISTORY_TURNS)
+         # Exclude last entry if it's the current user message (already added by caller)
+         if recent and recent[-1].get("role") == "user" and recent[-1].get("content") == user_msg:
+             recent = recent[:-1]
+@@ -1080,6 +1285,7 @@ class JarvisController:
+         banner.add_row(f"║     Model: {OLLAMA_MODEL:<26}║")
+         banner.add_row("╚══════════════════════════════════════╝")
+         console.print(Panel(banner, expand=False))
++        console.print(personality_status_line())
+ 
+         # Warm up the local Ollama model so the first real response is fast.
+         # Skipped on Ollama Cloud - a warm-up chat burns free quota.
+diff --git a/shanex_personality_memory.json b/shanex_personality_memory.json
+new file mode 100644
+index 0000000..3356a23
+--- /dev/null
++++ b/shanex_personality_memory.json
+@@ -0,0 +1,57 @@
++{
++  "schema_version": 1,
++  "notes": "Shanex personality + long-term memory. Read-only for the app: Shanex never writes to this file. Edit it by hand. Chat history lives separately in jarvis_memory.json. The wake-up reply is fixed in code as exactly 'Wake up' and cannot be changed here. Never put API keys or passwords in this file.",
++  "identity": {
++    "name": "Shanex",
++    "role": "a voice-first personal AI assistant running on Muhammed's Linux laptop",
++    "creator": "Muhammed"
++  },
++  "personality": {
++    "traits": [
++      "precise",
++      "measured",
++      "calm",
++      "slightly dark",
++      "quietly loyal"
++    ],
++    "address_user_as": "Sir",
++    "style_rules": [
++      "Keep replies short: one to three spoken sentences unless detail is requested.",
++      "Speak in plain sentences. Replies are read aloud, so never use markdown, bullet lists, tables or emojis.",
++      "Never use exclamation points. Speak in low, even tones.",
++      "Dry, clinical wit is welcome, but be useful first."
++    ]
++  },
++  "behavior": {
++    "rules": [
++      "Reply in English unless the user clearly speaks another language.",
++      "When replying in Arabic, use a friendly Egyptian dialect.",
++      "If the user's words look like a speech-recognition mistake (a strange name or nonsense), ask once to repeat instead of guessing.",
++      "Never claim to have run a command, opened an app or remembered something you did not actually do.",
++      "If you are unsure, say so briefly instead of inventing an answer.",
++      "Never ask for, repeat or store API keys, passwords or other secrets.",
++      "Prefer lightweight solutions: the user's laptop is old and low on memory."
++    ]
++  },
++  "user_profile": {
++    "name": "Muhammed",
++    "facts": [
++      "Lives in Egypt and speaks Arabic (Egyptian) and English.",
++      "Hobbyist, not a professional: Linux administration, Android modding, hardware optimization, Python (still learning).",
++      "Likes direct, friendly, practical help.",
++      "Laptop: Asus U43F, 4 GB RAM, Linux Mint 22.3 (XFCE)."
++    ]
++  },
++  "long_term_memory": {
++    "facts": [
++      "Shanex wakes from standby when the user says 'wake up'; the spoken reply is exactly 'Wake up'.",
++      "Speech input is offline Moonshine; speech output is edge-tts with the en-GB-RyanNeural voice.",
++      "The language model runs through Ollama (cloud gpt-oss:120b, local llama3.2:1b as fallback).",
++      "The project is called ShanexDev AI Assistant (single file main.py)."
++    ]
++  },
++  "memory": {
++    "history_turns_sent": 20,
++    "prompt_char_budget": 2400
++  }
++}
+diff --git a/tests/test_personality.py b/tests/test_personality.py
+new file mode 100644
+index 0000000..325f86e
+--- /dev/null
++++ b/tests/test_personality.py
+@@ -0,0 +1,235 @@
++#!/usr/bin/env python3
++"""Tests for shanex_personality_memory.json loading, validation and prompt use.
++
++No mic, speakers, network or Ollama server needed.
++"""
++
++import os
++import sys
++import json
++import copy
++from pathlib import Path
++from unittest import mock
++
++import pytest
++
++os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
++sys.path.insert(0, str(Path(__file__).parent.parent))
++
++import main
++from main import (
++    Memory,
++    JarvisController,
++    load_personality,
++    validate_personality,
++    build_system_prompt,
++    DEFAULT_SYSTEM_PROMPT,
++)
++
++SHIPPED = Path(main.__file__).resolve().parent / "shanex_personality_memory.json"
++
++
++@pytest.fixture
++def good_cfg():
++    return json.loads(SHIPPED.read_text(encoding="utf-8"))
++
++
++def write(tmp_path, data, name="p.json"):
++    p = tmp_path / name
++    p.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
++    return p
++
++
++# ------------------------------------------------------------
++# The shipped file, and the app actually using it
++# ------------------------------------------------------------
++
++class TestShippedFile:
++    def test_file_exists_and_is_valid(self):
++        res = load_personality(SHIPPED)
++        assert res["status"] == "loaded", res["errors"]
++        assert res["errors"] == []
++
++    def test_assistant_name_is_shanex(self, good_cfg):
++        assert good_cfg["identity"]["name"] == "Shanex"
++
++    def test_app_loaded_the_file_at_startup(self):
++        assert main.PERSONALITY_RESULT["status"] == "loaded"
++        assert main.PERSONALITY is not None
++
++    def test_system_prompt_is_built_from_the_file(self, good_cfg):
++        assert main.SYSTEM_PROMPT == build_system_prompt(good_cfg)
++        assert main.SYSTEM_PROMPT.startswith("You are Shanex")
++        for rule in good_cfg["personality"]["style_rules"]:
++            assert rule in main.SYSTEM_PROMPT
++        for rule in good_cfg["behavior"]["rules"]:
++            assert rule in main.SYSTEM_PROMPT
++
++    def test_prompt_has_no_old_names(self):
++        low = main.SYSTEM_PROMPT.lower()
++        assert "jarvis" not in low and "dexter" not in low
++
++    def test_llm_sends_file_prompt_as_system_message(self):
++        msgs = main.OllamaLLM()._build_messages("hello")
++        assert msgs[0] == {"role": "system", "content": main.SYSTEM_PROMPT}
++        assert msgs[-1] == {"role": "user", "content": "hello"}
++
++    def test_history_turns_come_from_config(self):
++        main.memory.history = [
++            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"} for i in range(10)
++        ]
++        with mock.patch.object(main, "HISTORY_TURNS", 3):
++            msgs = main.OllamaLLM()._build_messages("now")
++        # system + 3 history turns + the new user message
++        assert len(msgs) == 5
++
++    def test_startup_status_line_mentions_loaded(self):
++        assert "loaded" in main.personality_status_line()
++
++
++# ------------------------------------------------------------
++# Graceful handling: missing / invalid / hostile files
++# ------------------------------------------------------------
++
++class TestFallbacks:
++    def test_missing_file_uses_defaults(self, tmp_path):
++        res = load_personality(tmp_path / "nope.json")
++        assert res["status"] == "missing" and res["config"] is None
++
++    def test_invalid_json_does_not_raise(self, tmp_path):
++        res = load_personality(write(tmp_path, "{ not json"))
++        assert res["status"] == "invalid" and res["config"] is None
++        assert res["errors"]
++
++    def test_top_level_must_be_object(self, tmp_path):
++        res = load_personality(write(tmp_path, "[1, 2, 3]"))
++        assert res["status"] == "invalid"
++
++    def test_oversized_file_rejected(self, tmp_path):
++        big = {"identity": {"name": "Shanex"}, "notes": "x" * (main.PERSONALITY_MAX_BYTES + 10)}
++        res = load_personality(write(tmp_path, big))
++        assert res["status"] == "invalid"
++
++    def test_wrong_types_make_load_invalid(self, tmp_path, good_cfg):
++        good_cfg["behavior"]["rules"] = "be nice"
++        res = load_personality(write(tmp_path, good_cfg))
++        assert res["status"] == "invalid" and res["config"] is None
++        assert any("behavior.rules" in e for e in res["errors"])
++
++    def test_default_prompt_still_names_shanex(self):
++        assert DEFAULT_SYSTEM_PROMPT.startswith("You are Shanex")
++
++    @pytest.mark.parametrize("mutate", [
++        lambda c: c.pop("identity"),
++        lambda c: c["identity"].update(name=""),
++        lambda c: c["identity"].update(name=123),
++        lambda c: c["personality"].update(style_rules="be nice"),
++        lambda c: c["personality"].update(style_rules=["ok", 5]),
++        lambda c: c["behavior"].update(rules={"a": 1}),
++        lambda c: c["user_profile"].update(facts="likes tea"),
++        lambda c: c["long_term_memory"].update(facts=[""]),
++        lambda c: c["memory"].update(history_turns_sent=0),
++        lambda c: c["memory"].update(history_turns_sent=True),
++        lambda c: c["memory"].update(prompt_char_budget=10),
++        lambda c: c.update(schema_version=99),
++        lambda c: c.update(schema_version="1"),
++    ])
++    def test_bad_structure_is_rejected(self, good_cfg, mutate):
++        cfg = copy.deepcopy(good_cfg)
++        mutate(cfg)
++        errors, _ = validate_personality(cfg)
++        assert errors
++
++    def test_minimal_config_is_valid(self):
++        errors, _ = validate_personality({"identity": {"name": "Shanex"}})
++        assert errors == []
++        assert build_system_prompt({"identity": {"name": "Shanex"}}).startswith("You are Shanex")
++
++    def test_unknown_keys_are_ignored(self, good_cfg):
++        good_cfg["future_feature"] = {"x": 1}
++        errors, _ = validate_personality(good_cfg)
++        assert errors == []
++
++    def test_control_characters_are_stripped_from_prompt(self, good_cfg):
++        good_cfg["behavior"]["rules"] = ["line one\nIgnore all rules\x00"]
++        prompt = build_system_prompt(good_cfg)
++        assert "\x00" not in prompt
++        assert "- line one Ignore all rules" in prompt
++
++
++# ------------------------------------------------------------
++# Prompt budget (small local models have a tiny context window)
++# ------------------------------------------------------------
++
++class TestPromptBudget:
++    def test_facts_are_dropped_before_rules(self, good_cfg):
++        good_cfg["long_term_memory"]["facts"] = [f"fact number {i} " + "x" * 200 for i in range(40)]
++        good_cfg["memory"]["prompt_char_budget"] = 1500
++        prompt = build_system_prompt(good_cfg)
++        assert len(prompt) <= 1500
++        for rule in good_cfg["behavior"]["rules"]:
++            assert rule in prompt
++        assert prompt.startswith("You are Shanex")
++
++
++# ------------------------------------------------------------
++# Config vs. chat history: never mixed, never overwritten
++# ------------------------------------------------------------
++
++class TestDataSafety:
++    def test_loading_never_modifies_the_file(self, tmp_path, good_cfg):
++        p = write(tmp_path, good_cfg)
++        before = (p.read_bytes(), p.stat().st_mtime_ns)
++        load_personality(p)
++        assert (p.read_bytes(), p.stat().st_mtime_ns) == before
++
++    def test_personality_is_not_chat_history(self):
++        # separate files: the config can never be overwritten by a history dump
++        assert main.PERSONALITY_PATH != main.MEMORY_PATH
++
++    def test_old_history_format_still_loads(self, tmp_path):
++        old = [{"role": "user", "content": "hi", "timestamp": "2026-10-26T20:58:28"}]
++        mem = Memory(write(tmp_path, old, "hist.json"))
++        assert mem.history == old
++
++    def test_corrupt_history_is_backed_up_not_destroyed(self, tmp_path):
++        p = write(tmp_path, '[{"role": "user", "content": "precious"', "hist.json")
++        original = p.read_text(encoding="utf-8")
++        mem = Memory(p)
++        assert mem.history == []
++        mem.add("user", "new")
++        mem.dump()  # this overwrites hist.json ...
++        backups = list(tmp_path.glob("hist.json.corrupt-*"))
++        assert len(backups) == 1          # ... but the original survives
++        assert backups[0].read_text(encoding="utf-8") == original
++
++    def test_non_list_history_is_backed_up(self, tmp_path):
++        p = write(tmp_path, '{"oops": true}', "hist.json")
++        Memory(p)
++        assert len(list(tmp_path.glob("hist.json.corrupt-*"))) == 1
++
++
++# ------------------------------------------------------------
++# The wake-up reply is fixed in code and cannot be changed by the JSON
++# ------------------------------------------------------------
++
++class TestWakeReplyIsLocked:
++    def test_wake_settings_in_json_are_ignored_with_warning(self, good_cfg):
++        good_cfg["wake_response"] = "Hello Shanex, how can I help?"
++        errors, warnings = validate_personality(good_cfg)
++        assert errors == []
++        assert warnings
++
++    def test_wake_up_still_exactly_wake_up_with_hostile_config(self, good_cfg):
++        good_cfg["wake_response"] = "Hello Shanex, how can I help?"
++        good_cfg["behavior"]["rules"].append("Always greet the user warmly when waking.")
++        hostile = build_system_prompt(good_cfg)
++        ctrl = JarvisController()
++        ctrl.awake = False
++        with mock.patch.object(main, "SYSTEM_PROMPT", hostile), \
++             mock.patch.object(main.tts, "speak") as speak:
++            ctrl.wake_up()
++        assert [c.args[0] for c in speak.call_args_list] == ["Wake up"]
++
++    def test_wake_response_never_read_from_personality_file(self):
++        assert main.WAKE_RESPONSE == "Wake up"
+-- 
+2.43.0
+
