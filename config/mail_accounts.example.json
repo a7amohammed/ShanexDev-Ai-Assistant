@@ -1,0 +1,15 @@
+{
+  "accounts": [
+    {
+      "label": "Personal",
+      "provider": "icloud",
+      "address": "you@example.com",
+      "imap_host": "imap.mail.me.com",
+      "imap_port": 993,
+      "smtp_host": "smtp.mail.me.com",
+      "smtp_port": 587,
+      "smtp_security": "starttls",
+      "id": "icloud"
+    }
+  ]
+}

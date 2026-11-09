@@ -1,0 +1,15 @@
+# Secrets and personal data - never commit these
+.env
+config/api_keys.json
+config/mail_accounts.json
+config/.spotify_cache
+config/certs/*
+!config/certs/.gitkeep
+memory/long_term.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/

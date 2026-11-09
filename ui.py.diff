@@ -1,0 +1,1508 @@
+--- ui.orig.py	2026-10-09 18:14:34.453802047 +0000
++++ Mark-LIV-correo-1/ui.py	2026-10-09 19:41:26.615179000 +0000
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import bisect
+ import json
+ import math
+ import os
+@@ -26,7 +27,7 @@
+ )
+ from PyQt6.QtGui import (
+     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
+-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
++    QFontDatabase, QFontMetricsF, QKeySequence, QLinearGradient, QPainter, QPainterPath,
+     QPen, QPixmap, QPolygon, QPolygonF, QRadialGradient, QRegion, QShortcut,
+ )
+ from PyQt6.QtWidgets import (
+@@ -2555,54 +2556,313 @@
+             p.drawEllipse(target, 5, 5)
+ 
+ 
++class HudIconButton(QPushButton):
++    """Control button for the Spotify mini-player: chamfered HUD plate with a
++    thin-line icon painted by QPainter (no emoji / no font glyphs, so it looks
++    identical on every OS and re-tints with the HUD accent colour).
++
++    kind: "prev" | "play" | "pause" | "next" | "shuffle"
++    Colours are read from `C` at paint time → apply_ui_accent() is honoured.
++    """
++
++    _CUT = 5.0     # chamfer size of the plate corners (top-left / bottom-right)
++
++    def __init__(self, kind: str, parent=None):
++        super().__init__(parent)
++        self._kind  = kind
++        self._hover = False
++        self.setFlat(True)
++        self.setCursor(Qt.CursorShape.PointingHandCursor)
++        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
++        self.setMouseTracking(True)
++
++    # ── public ───────────────────────────────────────────────────────────────
++    def set_kind(self, kind: str):
++        if kind != self._kind:
++            self._kind = kind
++            self.update()
++
++    # ── hover tracking ───────────────────────────────────────────────────────
++    def enterEvent(self, e):
++        self._hover = True
++        self.update()
++        super().enterEvent(e)
++
++    def leaveEvent(self, e):
++        self._hover = False
++        self.update()
++        super().leaveEvent(e)
++
++    # ── icon geometry (unit square, y down) ──────────────────────────────────
++    @staticmethod
++    def _poly(*pts) -> QPainterPath:
++        path = QPainterPath()
++        path.moveTo(*pts[0])
++        for x, y in pts[1:]:
++            path.lineTo(x, y)
++        path.closeSubpath()
++        return path
++
++    @staticmethod
++    def _line(*pts) -> QPainterPath:
++        path = QPainterPath()
++        path.moveTo(*pts[0])
++        for x, y in pts[1:]:
++            path.lineTo(x, y)
++        return path
++
++    def _icon_paths(self) -> tuple[list[QPainterPath], list[QPainterPath]]:
++        """(closed shapes — outlined + faint fill, open strokes — outline only)"""
++        P, L, k = self._poly, self._line, self._kind
++        if k == "play":
++            return [P((0.20, 0.04), (0.94, 0.50), (0.20, 0.96))], []
++        if k == "pause":
++            return [P((0.12, 0.06), (0.38, 0.06), (0.38, 0.94), (0.12, 0.94)),
++                    P((0.62, 0.06), (0.88, 0.06), (0.88, 0.94), (0.62, 0.94))], []
++        if k == "next":
++            return [P((0.04, 0.10), (0.70, 0.50), (0.04, 0.90))], \
++                   [L((0.92, 0.08), (0.92, 0.92))]
++        if k == "prev":
++            return [P((0.96, 0.10), (0.30, 0.50), (0.96, 0.90))], \
++                   [L((0.08, 0.08), (0.08, 0.92))]
++        if k == "close":
++            return [], [L((0.12, 0.12), (0.88, 0.88)), L((0.88, 0.12), (0.12, 0.88))]
++        if k == "pin":
++            return [P((0.50, 0.02), (0.90, 0.40), (0.50, 0.74), (0.10, 0.40))], \
++                   [L((0.50, 0.74), (0.50, 1.00))]
++        if k == "shuffle":
++            return [], [
++                L((0.00, 0.78), (0.28, 0.78), (0.64, 0.24), (0.88, 0.24)),
++                L((0.76, 0.10), (0.94, 0.24), (0.76, 0.38)),
++                L((0.00, 0.24), (0.28, 0.24), (0.64, 0.78), (0.88, 0.78)),
++                L((0.76, 0.64), (0.94, 0.78), (0.76, 0.92)),
++            ]
++        return [], []
++
++    # ── painting ─────────────────────────────────────────────────────────────
++    def paintEvent(self, _):
++        W, H = self.width(), self.height()
++        if W < 6 or H < 6:
++            return
++        p = QPainter(self)
++        if not p.isActive():
++            return
++        p.setRenderHint(QPainter.RenderHint.Antialiasing)
++
++        lit     = self._hover or self.isDown() or self.isChecked()
++        pri     = QColor(C.PRI)
++        line    = pri if lit else QColor(C.TEXT_MED)
++        border  = pri if (self._hover or self.isChecked()) else QColor(C.BORDER_B)
++        c       = min(self._CUT, H * 0.30)
++
++        # chamfered plate: cut top-left and bottom-right corners
++        x0, y0, x1, y1 = 0.5, 0.5, W - 0.5, H - 0.5
++        plate = QPolygonF([
++            QPointF(x0 + c, y0), QPointF(x1, y0), QPointF(x1, y1 - c),
++            QPointF(x1 - c, y1), QPointF(x0, y1), QPointF(x0, y0 + c),
++        ])
++        fill = QColor(pri)
++        fill.setAlpha(70 if self.isDown() else (34 if lit else 10))
++        pen_b = QPen(border, 1.0)
++        pen_b.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
++        p.setPen(pen_b)
++        p.setBrush(fill)
++        p.drawPolygon(plate)
++
++        # bright corner ticks on the two chamfers (HUD bracket feel)
++        tick = QPen(pri if lit else QColor(C.PRI_DIM), 1.4)
++        tick.setCapStyle(Qt.PenCapStyle.FlatCap)
++        p.setPen(tick)
++        p.drawLine(QPointF(x0, y0 + c), QPointF(x0 + c, y0))
++        p.drawLine(QPointF(x1, y1 - c), QPointF(x1 - c, y1))
++
++        # icon, centred, ~45 % of the plate height
++        s = max(6.0, min(H * 0.50, W * 0.50, 14.0))
++        p.save()
++        p.translate(W / 2 - s / 2, H / 2 - s / 2)
++        p.scale(s, s)
++
++        shapes, strokes = self._icon_paths()
++        face = QColor(line)
++        face.setAlpha(60 if lit else 28)
++
++        if lit:                                  # soft neon glow underlay
++            glow = QColor(pri)
++            glow.setAlpha(55)
++            g = QPen(glow, 3.6)
++            g.setCosmetic(True)
++            g.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
++            g.setCapStyle(Qt.PenCapStyle.RoundCap)
++            p.setPen(g)
++            p.setBrush(Qt.BrushStyle.NoBrush)
++            for path in shapes + strokes:
++                p.drawPath(path)
++
++        pen = QPen(line, 1.25)
++        pen.setCosmetic(True)
++        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
++        pen.setCapStyle(Qt.PenCapStyle.SquareCap)
++        p.setPen(pen)
++        p.setBrush(face)
++        for path in shapes:
++            p.drawPath(path)
++        p.setBrush(Qt.BrushStyle.NoBrush)
++        for path in strokes:
++            p.drawPath(path)
++        p.restore()
++
++        # shuffle ON indicator: short neon bar under the icon
++        if self._kind == "shuffle" and self.isChecked():
++            p.setPen(QPen(pri, 1.6))
++            p.drawLine(QPointF(W / 2 - 5, H - 3.5), QPointF(W / 2 + 5, H - 3.5))
++        p.end()
++
++
++class _ElideLabel(QLabel):
++    """Single-line label: long text is cut with '…' instead of wrapping or
++    spilling over neighbouring widgets (full text stays in the tooltip)."""
++
++    def __init__(self, text: str = "", parent=None):
++        super().__init__(parent)
++        self._full  = text or ""
++        self._color = QColor(C.TEXT)
++        self.setWordWrap(False)
++        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
++        self.setMinimumWidth(0)
++
++    def set_color(self, color: str):
++        self._color = QColor(color)
++        self.update()
++
++    def setText(self, text: str):                      # noqa: N802 (Qt naming)
++        text = text or ""
++        if text != self._full:
++            self._full = text
++            self.setToolTip(text)
++            self.updateGeometry()
++            self.update()
++
++    def text(self) -> str:
++        return self._full
++
++    def sizeHint(self) -> QSize:
++        fm = self.fontMetrics()
++        return QSize(fm.horizontalAdvance(self._full), fm.height() + 2)
++
++    def minimumSizeHint(self) -> QSize:
++        return QSize(0, self.fontMetrics().height() + 2)
++
++    def paintEvent(self, _):
++        p = QPainter(self)
++        if not p.isActive():
++            return
++        p.setFont(self.font())
++        p.setPen(self._color)
++        shown = self.fontMetrics().elidedText(
++            self._full, Qt.TextElideMode.ElideRight, max(0, self.width()))
++        p.drawText(self.rect(), Qt.AlignmentFlag.AlignVCenter | self.alignment(), shown)
++        p.end()
++
++
+ class SpotifyMiniPlayer(HudFrame):
+     """Compact Spotify panel that lives inside the left sidebar.
+ 
+-    Adapts its layout to the available vertical space:
+-    - COMPACT  (height < 200 px, small window): 36 px art + text in a row.
+-    - EXPANDED (height ≥ 200 px, fullscreen / tall window): centred art
+-      90 px at the top, title and artist below, more eye-catching.
++    • COMPACT  (height < _EXPAND_AT): 36 px cover + title/artist in one row.
++    • EXPANDED (height ≥ _EXPAND_AT): centred cover that grows with the panel,
++      title/artist below.
++    • The bottom edge is a drag handle: grab it (cursor turns into ↕) and drag
++      to make the player taller/shorter; double-click it to go back to the
++      automatic height. The chosen height is remembered between sessions.
+ 
+-    The layout change is automatic via resizeEvent — nothing needs to be touched
+-    from outside.
++    Both modes are separate child pages (no widgets are re-parented), titles
++    and artists are single-line with '…' elision, so nothing can overlap.
+     """
+ 
+     play_pause_clicked = pyqtSignal()
+     next_clicked       = pyqtSignal()
+     previous_clicked   = pyqtSignal()
++    shuffle_clicked    = pyqtSignal()
+ 
+-    _COMPACT_ART  = 36
+-    _EXPANDED_ART = 90
+-    _EXPAND_AT    = 200   # minimum height in pixels for the expanded layout
++    _COMPACT_ART = 36
++    _EXPAND_AT   = 176      # px of height from which the expanded page is used
++    _MIN_H       = 112
++    _MAX_H       = 380
++    _GRIP_H      = 10       # height of the draggable zone at the bottom edge
++    _UI_NS       = "spotify_ui"
++
++    # MAXIMUM button sizes per mode: (side width, height). The play/pause
++    # button is _PP_RATIO × wider. Actual sizes shrink with the panel width
++    # (see _apply_btn_sizes) so the four buttons can never touch or overlap.
++    _BTN_COMPACT  = (24, 18)
++    _BTN_EXPANDED = (28, 22)
++    _PP_RATIO     = 1.3
++    _BTN_MIN_W    = 8
+ 
+     def __init__(self, parent=None):
+         super().__init__(cuts=(12, 0, 12, 0), glow=True, tint=0.09, parent=parent)
+ 
+-        self._art_bytes: bytes | None = None
+-        self._art_key   = None
+-        self._expanded  = False   # layout actual
++        self._art_px: QPixmap | None = None
++        self._art_url   = ""
++        self._expanded  = False
++        self._playing   = False
++        self._drag_y: float | None = None
++        self._drag_h    = 0
++        self._grip_hot  = False
++        self.setMouseTracking(True)
+ 
+-        # ── root layout ─────────────────────────────────────────────────────
+         root = QVBoxLayout(self)
+-        root.setContentsMargins(14, 12, 14, 12)
++        root.setContentsMargins(14, 12, 14, 14)     # 14 px bottom = grip zone
+         root.setSpacing(4)
+ 
+-        # header — siempre visible
+-        hdr = QLabel("♪  NOW PLAYING")
+-        hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+-        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+-        root.addWidget(hdr)
+-
+-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+-        sep.setStyleSheet(f"color: {C.BORDER}; margin: 0;")
+-        root.addWidget(sep)
++        self._hdr = QLabel("◈  NOW PLAYING  //  SPOTIFY")
++        self._hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
++        self._hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
++        root.addWidget(self._hdr)
++
++        self._sep = QFrame(); self._sep.setFrameShape(QFrame.Shape.HLine)
++        self._sep.setStyleSheet(f"color: {C.BORDER}; margin: 0;")
++        root.addWidget(self._sep)
++
++        # ── compact page: [cover] [title / artist] ──────────────────────────
++        self._page_c = QWidget()
++        self._page_c.setStyleSheet("background: transparent;")
++        row = QHBoxLayout(self._page_c)
++        row.setContentsMargins(0, 0, 0, 0)
++        row.setSpacing(8)
++        self._art_c    = self._mk_art(self._COMPACT_ART, 3, C.BORDER)
++        self._title_c  = self._mk_text(7, True,  C.TEXT,     Qt.AlignmentFlag.AlignLeft)
++        self._artist_c = self._mk_text(6, False, C.TEXT_DIM, Qt.AlignmentFlag.AlignLeft)
++        col = QVBoxLayout()
++        col.setSpacing(2)
++        col.addStretch()
++        col.addWidget(self._title_c)
++        col.addWidget(self._artist_c)
++        col.addStretch()
++        row.addWidget(self._art_c, 0, Qt.AlignmentFlag.AlignVCenter)
++        row.addLayout(col, 1)
++        root.addWidget(self._page_c, 1)
+ 
+-        # ── art + info container (replaced depending on the mode) ──────────
+-        self._media_container = QWidget()
+-        self._media_container.setStyleSheet("background: transparent;")
+-        root.addWidget(self._media_container, stretch=1)
++        # ── expanded page: cover on top, text below ─────────────────────────
++        self._page_e = QWidget()
++        self._page_e.setStyleSheet("background: transparent;")
++        # Ignored vertically → the page never forces the (fixed-height) player
++        # taller; the cover is sized from the player height instead.
++        self._page_e.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored)
++        colx = QVBoxLayout(self._page_e)
++        colx.setContentsMargins(0, 2, 0, 2)
++        colx.setSpacing(4)
++        self._art_e    = self._mk_art(60, 6, C.BORDER_B)
++        self._title_e  = self._mk_text(8, True,  C.TEXT,     Qt.AlignmentFlag.AlignCenter)
++        self._artist_e = self._mk_text(7, False, C.TEXT_DIM, Qt.AlignmentFlag.AlignCenter)
++        colx.addStretch()
++        colx.addWidget(self._art_e, 0, Qt.AlignmentFlag.AlignHCenter)
++        colx.addWidget(self._title_e)
++        colx.addWidget(self._artist_e)
++        colx.addStretch()
++        root.addWidget(self._page_e, 1)
++        self._page_e.hide()
+ 
+-        # ── barra de progreso ────────────────────────────────────────────────
++        # ── progress bar ────────────────────────────────────────────────────
+         self._progress = QProgressBar()
+         self._progress.setFixedHeight(3)
+         self._progress.setTextVisible(False)
+@@ -2613,181 +2873,840 @@
+         """)
+         root.addWidget(self._progress)
+ 
+-        # ── controles ────────────────────────────────────────────────────────
++        # ── controls (fixed-size HUD buttons, centred, with a gap) ──────────
+         self._ctrl_row = QHBoxLayout()
+-        self._ctrl_row.setSpacing(3)
+-        self._ctrl_row.setContentsMargins(0, 0, 0, 0)
++        self._ctrl_row.setSpacing(0)                # gaps are explicit spacers
++        self._ctrl_row.setContentsMargins(0, 2, 0, 0)
+ 
+-        def _mk(txt: str) -> QPushButton:
+-            b = QPushButton(txt)
+-            b.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+-            b.setCursor(Qt.CursorShape.PointingHandCursor)
+-            b.setStyleSheet(f"""
+-                QPushButton {{ background: transparent; color: {C.TEXT_MED};
+-                    border: 1px solid {C.BORDER}; border-radius: 2px; }}
+-                QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
+-            """)
+-            return b
++        self._prev_btn    = HudIconButton("prev")
++        self._pp_btn      = HudIconButton("pause")
++        self._next_btn    = HudIconButton("next")
++        self._shuffle_btn = HudIconButton("shuffle")
++        self._shuffle_btn.setCheckable(True)
++
++        self._prev_btn.clicked.connect(self.previous_clicked.emit)
++        self._pp_btn.clicked.connect(self.play_pause_clicked.emit)
++        self._next_btn.clicked.connect(self.next_clicked.emit)
++        self._shuffle_btn.clicked.connect(self.shuffle_clicked.emit)
+ 
+-        self._prev_btn = _mk("⏮"); self._prev_btn.clicked.connect(self.previous_clicked.emit)
+-        self._pp_btn   = _mk("⏸"); self._pp_btn.clicked.connect(self.play_pause_clicked.emit)
+-        self._next_btn = _mk("⏭"); self._next_btn.clicked.connect(self.next_clicked.emit)
++        # layout: stretch, btn, gap, btn, gap, btn, gap, btn, stretch
++        self._ctrl_row.addStretch(1)
+         self._ctrl_row.addWidget(self._prev_btn)
+-        self._ctrl_row.addWidget(self._pp_btn, stretch=1)
++        self._ctrl_row.addSpacing(6)
++        self._ctrl_row.addWidget(self._pp_btn)
++        self._ctrl_row.addSpacing(6)
+         self._ctrl_row.addWidget(self._next_btn)
++        self._ctrl_row.addSpacing(6)
++        self._ctrl_row.addWidget(self._shuffle_btn)
++        self._ctrl_row.addStretch(1)
++        self._gap_idx = (2, 4, 6)                   # item indices of the 3 gaps
+         root.addLayout(self._ctrl_row)
+ 
+-        # labels compartidos (se mueven entre layouts)
+-        self._art_lbl = QLabel()
+-        self._art_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+-
+-        self._title_lbl = QLabel("—")
+-        self._title_lbl.setWordWrap(True)
+-        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft)
+-
+-        self._artist_lbl = QLabel("")
+-        self._artist_lbl.setWordWrap(True)
+-        self._artist_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft)
+-
+-        self._apply_compact_layout()
++        self._apply_btn_sizes(False)
++        self._load_height()
+         self.hide()
+ 
+-    # ── layout helpers ───────────────────────────────────────────────────────
+-
+-    def _clear_media_layout(self):
+-        old = self._media_container.layout()
+-        if old:
+-            # detach widgets from the layout without destroying them
+-            while old.count():
+-                item = old.takeAt(0)
+-                if item.widget():
+-                    item.widget().setParent(None)
+-                    item.widget().setParent(self._media_container)
+-            QWidget().setLayout(old)  # transfers and destroys the empty layout
+-
+-    def _apply_compact_layout(self):
+-        """36 px art + title/artist in a row (small-window mode)."""
+-        self._clear_media_layout()
+-        self._expanded = False
+-
+-        sz = self._COMPACT_ART
+-        self._art_lbl.setFixedSize(sz, sz)
+-        self._art_lbl.setStyleSheet(
+-            f"background: #000d12; border: 1px solid {C.BORDER}; border-radius: 3px;"
+-        )
+-        self._title_lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+-        self._title_lbl.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+-        self._artist_lbl.setFont(QFont("Courier New", 6))
+-        self._artist_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+-
+-        row = QHBoxLayout()
+-        row.setSpacing(6)
+-        row.setContentsMargins(0, 0, 0, 0)
+-        row.addWidget(self._art_lbl)
+-
+-        col = QVBoxLayout()
+-        col.setSpacing(1)
+-        col.addWidget(self._title_lbl)
+-        col.addWidget(self._artist_lbl)
+-        col.addStretch()
+-        row.addLayout(col, 1)
++    # ── small factories ──────────────────────────────────────────────────────
++    @staticmethod
++    def _mk_art(size: int, radius: int, border: str) -> QLabel:
++        lbl = QLabel()
++        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
++        lbl.setFixedSize(size, size)
++        lbl.setStyleSheet(
++            f"background: #000d12; border: 1px solid {border}; border-radius: {radius}px;")
++        return lbl
+ 
+-        container_lay = QVBoxLayout(self._media_container)
+-        container_lay.setContentsMargins(0, 0, 0, 0)
+-        container_lay.addLayout(row)
+-        container_lay.addStretch()
+-
+-        self._prev_btn.setFixedHeight(20)
+-        self._pp_btn.setFixedHeight(20)
+-        self._next_btn.setFixedHeight(20)
+-
+-        self._redraw_art()
+-
+-    def _apply_expanded_layout(self):
+-        """Arte 90 px centrado arriba + texto debajo (fullscreen / ventana alta)."""
+-        self._clear_media_layout()
+-        self._expanded = True
+-
+-        sz = self._EXPANDED_ART
+-        self._art_lbl.setFixedSize(sz, sz)
+-        self._art_lbl.setStyleSheet(
+-            f"background: #000d12; border: 1px solid {C.BORDER_B}; border-radius: 6px;"
+-        )
+-        self._title_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+-        self._title_lbl.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+-        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+-        self._artist_lbl.setFont(QFont("Courier New", 7))
+-        self._artist_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+-        self._artist_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+-
+-        col = QVBoxLayout(self._media_container)
+-        col.setContentsMargins(0, 4, 0, 4)
+-        col.setSpacing(6)
+-        col.addStretch()
++    @staticmethod
++    def _mk_text(pt: int, bold: bool, color: str, align) -> _ElideLabel:
++        lbl = _ElideLabel("")
++        lbl.setFont(QFont("Courier New", pt,
++                          QFont.Weight.Bold if bold else QFont.Weight.Normal))
++        lbl.set_color(color)
++        lbl.setAlignment(align)
++        return lbl
++
++    def _apply_btn_sizes(self, expanded: bool):
++        """Size the 4 buttons from the width actually available, so they fit
++        with a visible gap at ANY panel width (they shrink instead of
++        overlapping). Total = 3·side + pp + 3·gap  ≤  available width."""
++        base_w, base_h = self._BTN_EXPANDED if expanded else self._BTN_COMPACT
++        avail = max(40, self.width() - 28)          # root margins 14 + 14
++        units = 3 + self._PP_RATIO                  # 3 side buttons + 1 wide
++        gap   = 6
++        side  = (avail - 3 * gap) / units
++        if side < 12:                               # very narrow → tighter gaps
++            gap  = 3
++            side = (avail - 3 * gap) / units
++        if side < self._BTN_MIN_W + 2:
++            gap  = 2
++            side = (avail - 3 * gap) / units
++        side = int(max(self._BTN_MIN_W, min(base_w, side)))
++        pp_w = int(side * self._PP_RATIO)
++        h    = int(max(12, min(base_h, side * 0.8)))
++
++        for b in (self._prev_btn, self._next_btn, self._shuffle_btn):
++            b.setFixedSize(side, h)
++        self._pp_btn.setFixedSize(pp_w, h)
++
++        for i in self._gap_idx:
++            it = self._ctrl_row.itemAt(i)
++            sp = it.spacerItem() if it is not None else None
++            if sp is not None:
++                sp.changeSize(gap, 1, QSizePolicy.Policy.Fixed,
++                              QSizePolicy.Policy.Minimum)
++        self._ctrl_row.invalidate()
++
++    # ── mode switching ───────────────────────────────────────────────────────
++    def _set_mode(self, expanded: bool):
++        self._expanded = expanded
++        self._page_c.setVisible(not expanded)
++        self._page_e.setVisible(expanded)
++        self._apply_btn_sizes(expanded)
++        self._fit_expanded_art()
++        self._refresh_art()
++
++    def _fit_expanded_art(self):
++        """Cover grows/shrinks with the player height (computed from the
++        player's own size, not from the page, so it can shrink again)."""
++        if not self._expanded:
++            return
++        btn_h  = self._BTN_EXPANDED[1]
++        chrome = (12 + 14                                   # root margins
++                  + self._hdr.sizeHint().height()
++                  + self._sep.sizeHint().height()
++                  + 3 + btn_h + 2                           # progress + buttons
++                  + 4 * 4)                                  # root spacings
++        text   = self._title_e.sizeHint().height() + self._artist_e.sizeHint().height() + 8 + 4
++        avail_h = self.height() - chrome - text
++        avail_w = self.width() - 28
++        sz = int(max(40, min(avail_h, avail_w, 190)))
++        if sz != self._art_e.width():
++            self._art_e.setFixedSize(sz, sz)
++            self._refresh_art()
+ 
+-        art_row = QHBoxLayout()
+-        art_row.addStretch()
+-        art_row.addWidget(self._art_lbl)
+-        art_row.addStretch()
+-        col.addLayout(art_row)
+-
+-        col.addSpacing(4)
+-        col.addWidget(self._title_lbl)
+-        col.addWidget(self._artist_lbl)
+-        col.addStretch()
++    def resizeEvent(self, event):
++        super().resizeEvent(event)
++        want = self.height() >= self._EXPAND_AT
++        if want != self._expanded:
++            self._set_mode(want)
++        else:
++            self._fit_expanded_art()
++        self._apply_btn_sizes(self._expanded)
+ 
+-        self._prev_btn.setFixedHeight(26)
+-        self._pp_btn.setFixedHeight(26)
+-        self._next_btn.setFixedHeight(26)
+-
+-        self._redraw_art()
+-
+-    def _redraw_art(self):
+-        if not self._art_bytes:
+-            self._art_lbl.clear()
+-            return
+-        px = QPixmap()
+-        if px.loadFromData(self._art_bytes):
+-            sz = self._EXPANDED_ART if self._expanded else self._COMPACT_ART
+-            scaled = px.scaled(
+-                sz, sz,
++    # ── cover ────────────────────────────────────────────────────────────────
++    def _refresh_art(self):
++        for lbl in (self._art_c, self._art_e):
++            if self._art_px is None or self._art_px.isNull():
++                lbl.clear()
++                continue
++            d = max(8, min(lbl.width(), lbl.height()) - 4)   # inside the 1 px border
++            lbl.setPixmap(self._art_px.scaled(
++                d, d,
+                 Qt.AspectRatioMode.KeepAspectRatio,
+-                Qt.TransformationMode.SmoothTransformation,
+-            )
+-            self._art_lbl.setPixmap(scaled)
+-
+-    # ── automatic resize ─────────────────────────────────────────────────────
++                Qt.TransformationMode.SmoothTransformation))
+ 
+-    def resizeEvent(self, event):
+-        super().resizeEvent(event)
+-        want_expanded = self.height() >= self._EXPAND_AT
+-        if want_expanded != self._expanded:
+-            if want_expanded:
+-                self._apply_expanded_layout()
+-            else:
+-                self._apply_compact_layout()
++    # ── public API (unchanged names) ─────────────────────────────────────────
++    @property
++    def is_playing(self) -> bool:
++        return self._playing
+ 
+-    # ── public API ───────────────────────────────────────────────────────────
++    @property
++    def art_url_loaded(self) -> str | None:
++        """URL of the cover currently on screen, or None if it has not been
++        (successfully) loaded yet — the poller uses this to know when to
++        (re)download."""
++        return self._art_url if self._art_px is not None else None
+ 
+     def update_track(self, info: dict):
+-        key = (info.get("title", ""), info.get("artist", ""))
+-        self._title_lbl.setText(info.get("title") or "—")
+-        self._artist_lbl.setText(info.get("artist") or "")
+-        self._pp_btn.setText("⏸" if info.get("playing") else "▶")
++        title  = info.get("title") or "—"
++        artist = info.get("artist") or ""
++        for lbl, txt in ((self._title_c, title), (self._title_e, title),
++                         (self._artist_c, artist), (self._artist_e, artist)):
++            lbl.setText(txt)
++
++        self._playing = bool(info.get("playing"))
++        self._pp_btn.set_kind("pause" if self._playing else "play")
++        self._shuffle_btn.setChecked(bool(info.get("shuffle")))
+ 
+         dur = max(1, info.get("duration_ms") or 1)
+         pos = min(info.get("progress_ms") or 0, dur)
+         self._progress.setValue(int(pos / dur * 1000))
+ 
+-        if key != self._art_key:
+-            self._art_key = key
+-            self._art_bytes = None
+-            self._art_lbl.clear()
++        # Drop the cover ONLY when the album art actually changes — two songs
++        # from the same album share one image and must not blank it.
++        url = info.get("album_art") or ""
++        if url != self._art_url:
++            self._art_url = url
++            self._art_px  = None
++            self._refresh_art()
+         self.show()
+ 
+     def set_art(self, img_bytes: bytes):
+-        self._art_bytes = img_bytes
+-        self._redraw_art()
++        px = QPixmap()
++        if img_bytes and px.loadFromData(img_bytes):
++            self._art_px = px
++        else:
++            self._art_px = None
++        self._refresh_art()
++
++    # ── manual resize via the bottom edge ────────────────────────────────────
++    def _in_grip(self, y: float) -> bool:
++        return y >= self.height() - self._GRIP_H
++
++    def _apply_user_height(self, h: int):
++        h = int(max(self._MIN_H, min(self._MAX_H, h)))
++        self.setFixedHeight(h)
++
++    def _reset_height(self):
++        self.setMinimumHeight(0)
++        self.setMaximumHeight(16777215)      # QWIDGETSIZE_MAX → automatic again
++        self.updateGeometry()
++
++    def _load_height(self):
++        try:
++            from memory.config_manager import get_plugin_config
++            h = int(get_plugin_config(self._UI_NS).get("height") or 0)
++        except Exception:
++            h = 0
++        if h:
++            self._apply_user_height(h)
++
++    def _save_height(self, h: int):
++        try:
++            from memory.config_manager import save_plugin_config
++            save_plugin_config(self._UI_NS, {"height": int(h)})
++        except Exception:
++            pass
++
++    def mousePressEvent(self, e):
++        if e.button() == Qt.MouseButton.LeftButton and self._in_grip(e.position().y()):
++            self._drag_y = e.globalPosition().y()
++            self._drag_h = self.height()
++            self.update()
++            e.accept()
++            return
++        super().mousePressEvent(e)
++
++    def mouseMoveEvent(self, e):
++        if self._drag_y is not None:
++            self._apply_user_height(self._drag_h + (e.globalPosition().y() - self._drag_y))
++            e.accept()
++            return
++        hot = self._in_grip(e.position().y())
++        if hot != self._grip_hot:
++            self._grip_hot = hot
++            self.setCursor(Qt.CursorShape.SizeVerCursor if hot else Qt.CursorShape.ArrowCursor)
++            self.update()
++        super().mouseMoveEvent(e)
++
++    def mouseReleaseEvent(self, e):
++        if self._drag_y is not None:
++            self._drag_y = None
++            self._save_height(self.height())
++            self.update()
++            e.accept()
++            return
++        super().mouseReleaseEvent(e)
++
++    def mouseDoubleClickEvent(self, e):
++        if self._in_grip(e.position().y()):
++            self._reset_height()
++            self._save_height(0)
++            e.accept()
++            return
++        super().mouseDoubleClickEvent(e)
++
++    def leaveEvent(self, e):
++        if self._drag_y is None and self._grip_hot:
++            self._grip_hot = False
++            self.setCursor(Qt.CursorShape.ArrowCursor)
++            self.update()
++        super().leaveEvent(e)
++
++    def paintEvent(self, e):
++        super().paintEvent(e)                       # HUD plate (cached)
++        W, H = self.width(), self.height()
++        if W < 40 or H < 40:
++            return
++        p = QPainter(self)
++        if not p.isActive():
++            return
++        hot = self._grip_hot or self._drag_y is not None
++        p.setPen(QPen(QColor(C.PRI if hot else C.PRI_DIM), 1.2))
++        cx, y = W / 2, H - 5
++        p.drawLine(QPointF(cx - 9, y),     QPointF(cx + 9, y))
++        p.drawLine(QPointF(cx - 5, y - 3), QPointF(cx + 5, y - 3))
++        p.end()
++
++
++class LyricsView(QWidget):
++    """Apple-Music-style lyrics canvas, painted with QPainter.
++
++    • the line being sung is large + bright (with a faint neon halo), the rest
++      are smaller and dimmer, fading out towards the top/bottom edges;
++    • the list glides so the current line stays at ~38 % of the height;
++    • mouse wheel scrolls freely (auto-follow resumes after 3.5 s);
++    • click a line → seek_requested(ms).
++    Unsynced lyrics ("plain") are shown as a static, scrollable text.
++    """
++
++    seek_requested = pyqtSignal(int)
++
++    _PAD     = 22
++    _GAP     = 12
++    _LEAD_MS = 120          # highlight a line slightly before its timestamp
++    _FOCUS   = 0.38         # vertical position of the active line (0..1)
++    _FLAGS   = (Qt.TextFlag.TextWordWrap.value
++                | Qt.AlignmentFlag.AlignLeft.value
++                | Qt.AlignmentFlag.AlignVCenter.value)
++
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self.setMouseTracking(True)
++        self.setMinimumHeight(80)
++
++        self._font = QFont()
++        self._font.setFamilies(["Segoe UI", "SF Pro Display", "Helvetica Neue",
++                                "Noto Sans", "Arial"])
++        self._font.setBold(True)
++
++        self._state = "idle"      # idle|loading|synced|plain|instrumental|notfound|error
++        self._msg   = ""
++        self._lines: list[tuple[int, str]] = []
++        self._times: list[int] = []
++        self._hs: list[float] = []
++        self._ys: list[float] = []
++        self._total = 0.0
++        self._layout_key = None
++        self._emph: list[float] = []
++        self._active = -1
++        self._scroll = 0.0
++        self._snap   = True
++        self._override: float | None = None
++        self._override_until = 0.0
++        self._last_t = time.monotonic()
++
++    # ── content ──────────────────────────────────────────────────────────────
++    def set_state(self, state: str, msg: str = "", lines=None, plain: str = ""):
++        self._state = state
++        self._msg   = msg
++        if state == "synced" and lines:
++            self._lines = [(int(t), str(x)) for t, x in lines]
++        elif state == "plain" and plain:
++            self._lines = [(0, x.strip()) for x in plain.splitlines()]
++        else:
++            self._lines = []
++        self._times  = [t for t, _ in self._lines]
++        self._emph   = [0.0] * len(self._lines)
++        self._active = -1
++        self._scroll = 0.0
++        self._snap   = True
++        self._override = None
++        self._layout_key = None
++        self.update()
++
++    # ── geometry ─────────────────────────────────────────────────────────────
++    def _font_pt(self) -> float:
++        return max(12.0, min(30.0, self.width() / 17.0))
++
++    def _ensure_layout(self):
++        key = (self.width(), len(self._lines), self._state)
++        if key == self._layout_key:
++            return
++        self._layout_key = key
++        iw = max(40, self.width() - 2 * self._PAD)
++        f = QFont(self._font)
++        f.setPointSizeF(self._font_pt())
++        fm = QFontMetricsF(f)
++        synced = self._state == "synced"
++        self._hs, self._ys = [], []
++        y = 8.0
++        for _, text in self._lines:
++            if not text:
++                h = 30.0 if synced else 12.0
++            else:
++                h = fm.boundingRect(QRectF(0, 0, iw, 100000), self._FLAGS, text).height() + 8
++            self._hs.append(h)
++            self._ys.append(y)
++            y += h + self._GAP
++        self._total = y
++
++    def _clamp_scroll(self, v: float) -> float:
++        H = self.height()
++        if self._state == "synced":
++            lo, hi = -H * self._FOCUS, max(-H * self._FOCUS, self._total - H * 0.5)
++        else:
++            lo, hi = 0.0, max(0.0, self._total - H)
++        return max(lo, min(hi, v))
++
++    # ── animation step (called by the window's timer) ────────────────────────
++    def tick(self, pos_ms: float):
++        now = time.monotonic()
++        dt = min(0.1, max(0.001, now - self._last_t))
++        self._last_t = now
++        if self._state not in ("synced", "plain") or not self._lines:
++            return
++        self._ensure_layout()
++        H = self.height()
++
++        if self._state == "synced":
++            idx = bisect.bisect_right(self._times, pos_ms + self._LEAD_MS) - 1
++            self._active = idx
++            k = min(1.0, dt * 9.0)
++            for i in range(len(self._emph)):
++                tgt = 1.0 if i == idx else 0.0
++                e = self._emph[i]
++                if e != tgt:
++                    e += (tgt - e) * k
++                    self._emph[i] = tgt if abs(tgt - e) < 0.01 else e
++            if idx >= 0:
++                follow = self._ys[idx] + self._hs[idx] / 2 - H * self._FOCUS
++            else:
++                follow = -H * self._FOCUS + 8
++        else:
++            follow = self._scroll
++
++        if self._override is not None and now < self._override_until:
++            tgt = self._override
++        else:
++            self._override = None
++            tgt = follow
++        tgt = self._clamp_scroll(tgt)
++
++        if self._snap:
++            self._scroll, self._snap = tgt, False
++        else:
++            self._scroll += (tgt - self._scroll) * min(1.0, dt * 6.5)
++        self.update()
++
++    # ── input ────────────────────────────────────────────────────────────────
++    def wheelEvent(self, e):
++        if self._state not in ("synced", "plain") or not self._lines:
++            return
++        now = time.monotonic()
++        base = (self._override if (self._override is not None and now < self._override_until)
++                else self._scroll)
++        self._override = self._clamp_scroll(base - e.angleDelta().y() * 0.8)
++        self._override_until = now + (1e9 if self._state == "plain" else 3.5)
++        e.accept()
++
++    def _line_at(self, y: float) -> int:
++        yc = y + self._scroll
++        for i, (top, h) in enumerate(zip(self._ys, self._hs)):
++            if top - self._GAP / 2 <= yc < top + h + self._GAP / 2:
++                return i
++        return -1
++
++    def mouseMoveEvent(self, e):
++        if self._state == "synced":
++            i = self._line_at(e.position().y())
++            self.setCursor(Qt.CursorShape.PointingHandCursor if i >= 0
++                           else Qt.CursorShape.ArrowCursor)
++        super().mouseMoveEvent(e)
++
++    def mouseReleaseEvent(self, e):
++        if e.button() == Qt.MouseButton.LeftButton and self._state == "synced":
++            i = self._line_at(e.position().y())
++            if i >= 0:
++                self._override = None
++                self.seek_requested.emit(self._times[i])
++        super().mouseReleaseEvent(e)
++
++    # ── painting ─────────────────────────────────────────────────────────────
++    @staticmethod
++    def _mix(a: QColor, b: QColor, t: float) -> QColor:
++        return QColor(int(a.red() + (b.red() - a.red()) * t),
++                      int(a.green() + (b.green() - a.green()) * t),
++                      int(a.blue() + (b.blue() - a.blue()) * t))
++
++    def paintEvent(self, _):
++        p = QPainter(self)
++        if not p.isActive():
++            return
++        p.setRenderHint(QPainter.RenderHint.Antialiasing)
++        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
++        W, H = self.width(), self.height()
++        pad = self._PAD
++
++        if not self._lines:
++            f = QFont(self._font)
++            f.setPointSizeF(max(10.0, min(15.0, W / 28.0)))
++            f.setBold(False)
++            p.setFont(f)
++            p.setPen(QColor(C.TEXT_DIM))
++            msg = self._msg or ""
++            p.drawText(QRectF(pad, 0, max(10, W - 2 * pad), H),
++                       Qt.AlignmentFlag.AlignCenter.value | Qt.TextFlag.TextWordWrap.value, msg)
++            p.end()
++            return
++
++        self._ensure_layout()
++        iw = max(40, W - 2 * pad)
++        f = QFont(self._font)
++        f.setPointSizeF(self._font_pt())
++        p.setFont(f)
++
++        synced  = self._state == "synced"
++        c_act   = QColor(C.WHITE)
++        c_dim   = QColor(C.TEXT_MED)
++        c_pri   = QColor(C.PRI)
++        now     = time.monotonic()
++
++        for i, (_, text) in enumerate(self._lines):
++            top, h = self._ys[i] - self._scroll, self._hs[i]
++            if top + h < -10 or top > H + 10:
++                continue
++            e  = self._emph[i] if synced else 0.62
++            yc = top + h / 2
++            edge = max(0.0, min(1.0, min(yc, H - yc) / (H * 0.16)))
++            opacity = (0.38 + 0.62 * e) * (0.22 + 0.78 * edge)
++
++            if not text:                                   # instrumental break → dots
++                if synced:
++                    for k in range(3):
++                        pulse = 0.35 + 0.65 * abs(math.sin(now * 2.2 + k * 0.7)) if e > 0.5 else 0.35
++                        col = QColor(c_pri)
++                        p.setOpacity(opacity * pulse)
++                        p.setPen(Qt.PenStyle.NoPen)
++                        p.setBrush(col)
++                        p.drawEllipse(QPointF(pad + 8 + k * 14, yc), 3.2, 3.2)
++                    p.setBrush(Qt.BrushStyle.NoBrush)
++                continue
++
++            s = 0.86 + 0.14 * e
++            p.save()
++            p.setOpacity(opacity)
++            p.translate(pad, yc)
++            p.scale(s, s)
++            rect = QRectF(0, -h / 2, iw, h)
++            if e > 0.05:                                    # faint neon halo
++                halo = QColor(c_pri)
++                halo.setAlpha(int(70 * e))
++                p.setPen(halo)
++                for dx, dy in ((-1.6, 0), (1.6, 0), (0, -1.6), (0, 1.6)):
++                    p.drawText(rect.translated(dx, dy), self._FLAGS, text)
++            p.setPen(self._mix(c_dim, c_act, e))
++            p.drawText(rect, self._FLAGS, text)
++            p.restore()
++        p.end()
++
++
++class LyricsWindow(QWidget):
++    """Independent, frameless, resizable window with synced lyrics.
++
++    • drag it by the header; resize from any edge/corner; 📌-style pin button
++      (drawn, no emoji) toggles always-on-top; ✕ hides it;
++    • it follows whatever Spotify is playing: MainWindow feeds it every poll
++      via on_playback(info) and it interpolates the position locally, so the
++      highlight moves smoothly between polls;
++    • lyrics come from plugins/_lyrics_client.py (LRCLIB), fetched off-thread.
++    """
++
++    seek_requested = pyqtSignal(int)      # ms — MainWindow forwards to Spotify
++    closed         = pyqtSignal()
++    _lyrics_ready  = pyqtSignal(object, object)   # (track_key, result)
++
++    _EDGE  = 7
++    _CUT   = 10
++    _MIN_W = 260
++    _MIN_H = 240
++
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self.setWindowTitle("J.A.R.V.I.S. — Lyrics")
++        self.setWindowFlags(Qt.WindowType.Window
++                            | Qt.WindowType.FramelessWindowHint
++                            | Qt.WindowType.WindowStaysOnTopHint)
++        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
++        self.setMouseTracking(True)
++        self.setMinimumSize(self._MIN_W, self._MIN_H)
++        self.resize(420, 560)
++
++        self._placed    = False
++        self._track_key = None
++        self._err_t     = 0.0
++        self._last_info: dict = {}
++        self._base_ms   = 0.0
++        self._base_t    = time.monotonic()
++        self._playing   = False
++        self._drag: QPointF | None = None
++        self._resize: tuple | None = None
++        self._bg_pm: QPixmap | None = None
++        self._bg_key = None
++
++        lay = QVBoxLayout(self)
++        lay.setContentsMargins(12, 12, 12, 10)
++        lay.setSpacing(2)
++
++        # ── header (drag handle) ────────────────────────────────────────────
++        self._head = QWidget()
++        self._head.setStyleSheet("background: transparent;")
++        hv = QVBoxLayout(self._head)
++        hv.setContentsMargins(2, 0, 2, 4)
++        hv.setSpacing(1)
++
++        top = QHBoxLayout()
++        top.setSpacing(6)
++        tag = QLabel("◈  LYRICS")
++        tag.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
++        tag.setStyleSheet(f"color: {C.PRI}; background: transparent;")
++        top.addWidget(tag, 1)
++        self._pin_btn   = HudIconButton("pin")
++        self._pin_btn.setCheckable(True)
++        self._pin_btn.setChecked(True)
++        self._pin_btn.setToolTip("Siempre visible")
++        self._close_btn = HudIconButton("close")
++        self._close_btn.setToolTip("Cerrar")
++        for b in (self._pin_btn, self._close_btn):
++            b.setFixedSize(24, 17)
++            top.addWidget(b)
++        self._pin_btn.toggled.connect(self._set_on_top)
++        self._close_btn.clicked.connect(self.close_window)
++        hv.addLayout(top)
++
++        self._title_lbl = _ElideLabel("")
++        tf = QFont(); tf.setFamilies(["Segoe UI", "SF Pro Display", "Helvetica Neue", "Arial"])
++        tf.setPointSize(11); tf.setBold(True)
++        self._title_lbl.setFont(tf)
++        self._title_lbl.set_color(C.WHITE)
++        self._artist_lbl = _ElideLabel("")
++        af = QFont(tf); af.setPointSize(9); af.setBold(False)
++        self._artist_lbl.setFont(af)
++        self._artist_lbl.set_color(C.TEXT_DIM)
++        hv.addWidget(self._title_lbl)
++        hv.addWidget(self._artist_lbl)
++        lay.addWidget(self._head)
++
++        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
++        sep.setStyleSheet(f"color: {C.BORDER};")
++        lay.addWidget(sep)
++
++        # ── lyrics canvas + status line ─────────────────────────────────────
++        self._view = LyricsView()
++        self._view.set_state("idle", "Play a song on Spotify\nto see its lyrics.")
++        self._view.seek_requested.connect(self._on_seek)
++        lay.addWidget(self._view, 1)
++
++        self._status = _ElideLabel("")
++        sf = QFont("Courier New", 6)
++        self._status.setFont(sf)
++        self._status.set_color(C.TEXT_DIM)
++        lay.addWidget(self._status)
++
++        self._lyrics_ready.connect(self._on_lyrics_ready)
++        self._tmr = QTimer(self)
++        self._tmr.setInterval(25)
++        self._tmr.timeout.connect(self._on_tick)
++
++    # ── window chrome ────────────────────────────────────────────────────────
++    def _set_on_top(self, on: bool):
++        was_visible = self.isVisible()
++        geo = self.geometry()
++        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(on))
++        if was_visible:
++            self.show()
++            self.setGeometry(geo)
++
++    def show_window(self):
++        if not self._placed:
++            self._placed = True
++            try:
++                scr = QApplication.primaryScreen().availableGeometry()
++                self.move(scr.right() - self.width() - 40, scr.top() + 80)
++            except Exception:
++                pass
++        self.show()
++        self.raise_()
++        self.activateWindow()
++
++    def close_window(self):
++        self.hide()
++        self.closed.emit()
++
++    def closeEvent(self, e):
++        e.ignore()
++        self.close_window()
++
++    def showEvent(self, e):
++        self._tmr.start()
++        super().showEvent(e)
++
++    def hideEvent(self, e):
++        self._tmr.stop()
++        super().hideEvent(e)
++
++    def paintEvent(self, _):
++        W, H = self.width(), self.height()
++        if W < 8 or H < 8:
++            return
++        dpr = self.devicePixelRatioF()
++        key = (W, H, dpr, C.PRI, C.PRI_DIM, C.DARK)
++        if self._bg_pm is None or self._bg_key != key:
++            def _draw(p: QPainter):
++                p.setRenderHint(QPainter.RenderHint.Antialiasing)
++                base = _chamfer_path(QRectF(1, 1, W - 2, H - 2), (self._CUT, 0, self._CUT, 0))
++                p.fillPath(base, QBrush(qcol(C.DARK, 238)))
++                _paint_hud_frame(p, W, H, (self._CUT, 0, self._CUT, 0),
++                                 glow=True, tint=0.14, inset=1.5)
++                # resize grip hint (bottom-right)
++                p.setPen(QPen(QColor(C.PRI_DIM), 1.0))
++                for k in (4, 8, 12):
++                    p.drawLine(QPointF(W - 5 - k, H - 5), QPointF(W - 5, H - 5 - k))
++            self._bg_pm = _render_layer(W, H, dpr, _draw)
++            self._bg_key = key
++        p = QPainter(self)
++        if not p.isActive():
++            return
++        p.drawPixmap(0, 0, self._bg_pm)
++        p.end()
++
++    # ── move / resize by hand (works the same on every OS) ───────────────────
++    def _edges_at(self, pos) -> int:
++        x, y, E = pos.x(), pos.y(), self._EDGE
++        ed = 0
++        if x <= E:                 ed |= 1
++        if x >= self.width() - E:  ed |= 2
++        if y <= E:                 ed |= 4
++        if y >= self.height() - E: ed |= 8
++        return ed
++
++    _CURSORS = {
++        1: Qt.CursorShape.SizeHorCursor,  2: Qt.CursorShape.SizeHorCursor,
++        4: Qt.CursorShape.SizeVerCursor,  8: Qt.CursorShape.SizeVerCursor,
++        5: Qt.CursorShape.SizeFDiagCursor, 10: Qt.CursorShape.SizeFDiagCursor,
++        6: Qt.CursorShape.SizeBDiagCursor, 9: Qt.CursorShape.SizeBDiagCursor,
++    }
++
++    def mousePressEvent(self, e):
++        if e.button() == Qt.MouseButton.LeftButton:
++            ed = self._edges_at(e.position())
++            if ed:
++                self._resize = (ed, e.globalPosition(), QRect(self.geometry()))
++                e.accept()
++                return
++            if self._head.geometry().contains(e.position().toPoint()):
++                self._drag = e.globalPosition() - QPointF(self.frameGeometry().topLeft())
++                self.setCursor(Qt.CursorShape.ClosedHandCursor)
++                e.accept()
++                return
++        super().mousePressEvent(e)
++
++    def mouseMoveEvent(self, e):
++        if self._resize is not None:
++            ed, start, geo = self._resize
++            d = e.globalPosition() - start
++            dx, dy = int(d.x()), int(d.y())
++            g = QRect(geo)
++            if ed & 1: g.setLeft(min(geo.left() + dx, geo.right() - self._MIN_W + 1))
++            if ed & 2: g.setRight(max(geo.right() + dx, geo.left() + self._MIN_W - 1))
++            if ed & 4: g.setTop(min(geo.top() + dy, geo.bottom() - self._MIN_H + 1))
++            if ed & 8: g.setBottom(max(geo.bottom() + dy, geo.top() + self._MIN_H - 1))
++            self.setGeometry(g)
++            e.accept()
++            return
++        if self._drag is not None:
++            self.move((e.globalPosition() - self._drag).toPoint())
++            e.accept()
++            return
++        ed = self._edges_at(e.position())
++        self.setCursor(self._CURSORS.get(ed, Qt.CursorShape.ArrowCursor))
++        super().mouseMoveEvent(e)
++
++    def mouseReleaseEvent(self, e):
++        if self._resize is not None or self._drag is not None:
++            self._resize = None
++            self._drag = None
++            self.setCursor(Qt.CursorShape.ArrowCursor)
++            e.accept()
++            return
++        super().mouseReleaseEvent(e)
++
++    # ── playback sync ────────────────────────────────────────────────────────
++    def _pos_ms(self) -> float:
++        if not self._playing:
++            return self._base_ms
++        return self._base_ms + (time.monotonic() - self._base_t) * 1000.0
++
++    def _on_tick(self):
++        self._view.tick(self._pos_ms())
++
++    def _on_seek(self, ms: int):
++        self._base_ms, self._base_t = float(ms), time.monotonic()
++        self.seek_requested.emit(int(ms))
++
++    def on_playback(self, info: dict | None):
++        """Fed by MainWindow on every Spotify poll (info=None → nothing playing)."""
++        now = time.monotonic()
++        if not info:
++            self._base_ms = self._pos_ms()
++            self._base_t  = now
++            self._playing = False
++            return
++
++        playing = bool(info.get("playing"))
++        got = float(info.get("progress_ms") or 0)
++        age = max(0.0, now - float(info.get("fetched_at") or now))
++        new_now = got + (age * 1000.0 if playing else 0.0)
++        est = self._pos_ms()
++        key = (info.get("id") or "", info.get("title") or "", info.get("artist") or "")
++
++        if key != self._track_key:
++            self._track_key = key
++            self._base_ms, self._base_t = new_now, now
++            self._playing = playing
++            self._start_fetch(info, key)
++            return
++
++        if abs(new_now - est) > 450 or playing != self._playing:
++            self._base_ms = new_now                     # seek / pause / resume → snap
++        else:
++            self._base_ms = est + (new_now - est) * 0.35  # tiny drift → ease in
++        self._base_t  = now
++        self._playing = playing
++
++        # lyrics service was unreachable → try again every ~8 s
++        if self._view._state == "error" and now - self._err_t > 8.0:
++            self._start_fetch(info, key)
++
++    # ── lyrics fetching ──────────────────────────────────────────────────────
++    def _start_fetch(self, info: dict, key):
++        title, artist = info.get("title") or "", info.get("artist") or ""
++        album, dur = info.get("album") or "", int(info.get("duration_ms") or 0)
++        self._title_lbl.setText(title)
++        self._artist_lbl.setText(artist)
++        self._view.set_state("loading", "Buscando letra…")
++        self._status.setText("BUSCANDO  //  LRCLIB")
++
++        def _worker():
++            try:
++                from plugins import _lyrics_client
++                res = _lyrics_client.fetch(title, artist, album, dur)
++            except Exception as ex:                       # never kill the thread silently
++                res = {"status": "error", "error": str(ex)}
++            self._lyrics_ready.emit(key, res)
++
++        threading.Thread(target=_worker, daemon=True).start()
++
++    def _on_lyrics_ready(self, key, res):
++        if key != self._track_key:
++            return                                        # track changed meanwhile
++        st = (res or {}).get("status")
++        if st == "synced":
++            self._view.set_state("synced", lines=res["synced"])
++            self._status.setText("SYNCHRONISED  //  LRCLIB  //  click a line to jump")
++        elif st == "plain":
++            self._view.set_state("plain", plain=res.get("plain", ""))
++            self._status.setText("SIN SINCRONIZAR  //  LRCLIB")
++        elif st == "instrumental":
++            self._view.set_state("instrumental", "Instrumental")
++            self._status.setText("")
++        elif st == "notfound":
++            self._view.set_state("notfound", "I could not find the lyrics for this song.")
++            self._status.setText("SIN RESULTADOS  //  LRCLIB")
++        else:
++            self._err_t = time.monotonic()
++            self._view.set_state("error", "No connection to the lyrics service.\nRetrying…")
++            self._status.setText("ERROR  //  LRCLIB")
+ 
+ 
+ class SetupOverlay(QWidget):
+@@ -4706,6 +5625,7 @@
+     _globe_flyto_sig = pyqtSignal(float, float, str)   # voice-triggered globe navigation
+     _show_images_sig = pyqtSignal(object, object)      # (sources, titles) — thread-safe image display
+     _show_videos_sig = pyqtSignal(object, object)      # (sources, titles) — thread-safe video display
++    _show_lyrics_sig = pyqtSignal()                    # thread-safe: open the synced-lyrics window
+     _show_mail_sig   = pyqtSignal(object)              # (messages) — thread-safe mail reader window
+ 
+     def __init__(self, face_path: str):
+@@ -4900,6 +5820,8 @@
+         # (_spotify_player itself is created inside _build_left_panel)
+         self._spotify_sig.connect(self._on_spotify_polled)
+         self._spotify_art_url = None
++        self._spotify_last_info = None
++        self._lyrics_win: LyricsWindow | None = None
+         self._spotify_tmr = QTimer(self)
+         self._spotify_tmr.timeout.connect(self._poll_spotify)
+         self._spotify_tmr.start(3000)
+@@ -4907,6 +5829,7 @@
+         self._globe_flyto_sig.connect(self._on_globe_flyto)
+         self._show_images_sig.connect(self.show_floating_images)
+         self._show_videos_sig.connect(self.show_floating_videos)
++        self._show_lyrics_sig.connect(self._open_lyrics)
+         self._show_mail_sig.connect(self.show_mail_reader)
+ 
+         self._overlay: SetupOverlay | None = None
+@@ -5565,6 +6488,7 @@
+         self._spotify_player.play_pause_clicked.connect(self._on_spotify_play_pause)
+         self._spotify_player.next_clicked.connect(self._on_spotify_next)
+         self._spotify_player.previous_clicked.connect(self._on_spotify_previous)
++        self._spotify_player.shuffle_clicked.connect(self._on_spotify_shuffle)
+         lay.addWidget(self._spotify_player)
+ 
+         lay.addStretch()
+@@ -7103,24 +8027,33 @@
+     def _poll_spotify(self):
+         """Runs every 3 s on the Qt timer, but the actual Spotify Web API call
+         happens on a background thread — this must never block the UI."""
++        if getattr(self, "_spotify_polling", False):
++            return                       # previous poll still running → skip
++        self._spotify_polling = True
++
+         def _worker():
+             try:
+-                from plugins import _spotify_client
+-                info = _spotify_client.now_playing()
+-            except Exception:
+-                info = None
+-
+-            art_bytes = None
+-            if info and info.get("album_art") and info["album_art"] != self._spotify_art_url:
+                 try:
+-                    import requests
+-                    r = requests.get(info["album_art"], timeout=4)
+-                    if r.ok:
+-                        art_bytes = r.content
+-                        self._spotify_art_url = info["album_art"]
++                    from plugins import _spotify_client
++                    info = _spotify_client.now_playing()
+                 except Exception:
+-                    pass
+-            self._spotify_sig.emit((info, art_bytes) if info else None)
++                    info = None
++
++                art_bytes = None
++                url = (info or {}).get("album_art") or ""
++                # download whenever the cover for this URL is not on screen
++                # (new album OR a previous download failed) — retried each poll
++                if url and url != self._spotify_player.art_url_loaded:
++                    try:
++                        import requests
++                        r = requests.get(url, timeout=6)
++                        if r.ok and r.content:
++                            art_bytes = r.content
++                    except Exception:
++                        pass
++                self._spotify_sig.emit((info, art_bytes) if info else None)
++            finally:
++                self._spotify_polling = False
+ 
+         threading.Thread(target=_worker, daemon=True).start()
+ 
+@@ -7128,8 +8061,14 @@
+         if payload is None:
+             self._spotify_player.hide()
+             self._spotify_art_url = None
++            self._spotify_last_info = None
++            if self._lyrics_win is not None:
++                self._lyrics_win.on_playback(None)
+             return
+         info, art_bytes = payload
++        self._spotify_last_info = info
++        if self._lyrics_win is not None:
++            self._lyrics_win.on_playback(info)
+         self._spotify_player.update_track(info)
+         if art_bytes:
+             self._spotify_player.set_art(art_bytes)
+@@ -7149,7 +8088,7 @@
+     def _on_spotify_play_pause(self):
+         # Trust the icon currently shown rather than re-querying — it reflects
+         # the last poll, which is at most 3 s stale.
+-        playing = self._spotify_player._pp_btn.text() == "⏸"
++        playing = self._spotify_player.is_playing
+         self._spotify_action("pause" if playing else "resume")
+ 
+     def _on_spotify_next(self):
+@@ -7158,6 +8097,35 @@
+     def _on_spotify_previous(self):
+         self._spotify_action("previous_track")
+ 
++    def _on_spotify_shuffle(self):
++        self._spotify_action("toggle_shuffle")
++
++    # ── synced lyrics window ─────────────────────────────────────────────────
++    def _open_lyrics(self):
++        """GUI thread. Creates (once) and shows the floating lyrics window,
++        then polls Spotify faster while it is open so the sync stays tight."""
++        if self._lyrics_win is None:
++            self._lyrics_win = LyricsWindow(self)
++            self._lyrics_win.seek_requested.connect(self._on_lyrics_seek)
++            self._lyrics_win.closed.connect(self._on_lyrics_closed)
++        self._lyrics_win.show_window()
++        self._spotify_tmr.setInterval(1500)
++        if self._spotify_last_info:
++            self._lyrics_win.on_playback(self._spotify_last_info)
++        self._poll_spotify()
++
++    def _on_lyrics_closed(self):
++        self._spotify_tmr.setInterval(3000)
++
++    def _on_lyrics_seek(self, ms: int):
++        def _worker():
++            try:
++                from plugins import _spotify_client
++                _spotify_client.seek(ms)
++            except Exception as e:
++                self._log.append_log(f"ERR: Spotify seek failed — {e}")
++        threading.Thread(target=_worker, daemon=True).start()
++
+     # ── 3D globe ──────────────────────────────────────────────────────────────
+ 
+     def _on_globe_flyto(self, lat: float, lon: float, label: str):
+@@ -7447,6 +8415,15 @@
+         except Exception:
+             pass
+ 
++    def show_lyrics(self) -> None:
++        """Thread-safe: opens the floating, resizable synced-lyrics window for
++        whatever Spotify is playing. Called from plugins/spotify_control.py,
++        which runs off the Qt thread."""
++        try:
++            self._win._show_lyrics_sig.emit()
++        except Exception:
++            pass
++
+     def show_mail_reader(self, messages: list) -> None:
+         """Thread-safe: opens (or refreshes) the holographic mail reader window
+         with `messages` — dicts from core.mail_client.get_message(). Called from

@@ -1,0 +1,21 @@
+{
+    "gemini_api_key": "YOUR_API_KEY_HERE",
+    "os_system": "windows",
+    "hud_style": "core",
+    "plugin_config": {
+        "spotify": {
+            "client_id": "YOUR_SPOTIFY_CLIENT_ID_HERE",
+            "client_secret": "YOUR_SPOTIFY_CLIENT_SECRET_HERE"
+        },
+        "spotify_ui": {
+            "height": 242
+        }
+    },
+    "wake_word_enabled": true,
+    "push_to_talk_enabled": false,
+    "voice_name": "Charon",
+    "assistant_name": "JARVIS",
+    "user_name": "",
+    "ui_color": "#00d4ff",
+    "camera_index": 0
+}

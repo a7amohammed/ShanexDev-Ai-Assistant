@@ -1,0 +1,66 @@
+{
+  "assets": [
+    {
+      "symbol": "BTC-USD",
+      "name": "Bitcoin",
+      "kind": "crypto",
+      "visible": true,
+      "pinned": true,
+      "alerts": false
+    },
+    {
+      "symbol": "ETH-USD",
+      "name": "Ethereum",
+      "kind": "crypto",
+      "visible": true,
+      "pinned": false,
+      "alerts": false
+    },
+    {
+      "symbol": "AAPL",
+      "name": "Apple",
+      "kind": "stock",
+      "visible": true,
+      "pinned": false,
+      "alerts": false
+    },
+    {
+      "symbol": "NVDA",
+      "name": "NVIDIA",
+      "kind": "stock",
+      "visible": true,
+      "pinned": false,
+      "alerts": false
+    }
+  ],
+  "ui": {
+    "fx": 1.0,
+    "fy": 1.0,
+    "w": 400,
+    "h": 250,
+    "collapsed": false,
+    "opacity": 0.92,
+    "accent": "",
+    "chart_type": "area",
+    "range": "1Y",
+    "show_list": true,
+    "show_news": true,
+    "show_volume": false,
+    "sparklines": true,
+    "locked": false,
+    "refresh_secs": 60,
+    "selected": "BTC-USD"
+  },
+  "alerts": {
+    "voice": true,
+    "sensitivity": "medium",
+    "move_pct_crypto": 6.0,
+    "move_pct_stock": 4.0,
+    "cooldown_min": 20,
+    "max_per_day": 6,
+    "poll_min": 10,
+    "quiet_enabled": false,
+    "quiet_start": "23:00",
+    "quiet_end": "08:00"
+  }
+}
